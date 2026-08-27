@@ -74,8 +74,12 @@ Nginx quien decide a qué contenedor va cada ruta.
   (https://dashboard.ngrok.com/get-started/your-authtoken).
 
 Docker, Docker Compose y ngrok los instalan los propios scripts si no están.
+
 Si la máquina ya trae Docker —como los entornos de Killercoda— la instalación
-se omite y el despliegue arranca en segundos.
+se omite y el despliegue arranca en segundos. Y si trae Docker pero de una
+versión anterior a `docker compose`, se instala **solo el plugin de Compose**
+descargando su binario, sin reinstalar Docker ni pasar por `apt`: son unos
+segundos en lugar de varios minutos.
 
 ## Uso
 

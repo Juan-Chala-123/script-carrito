@@ -145,6 +145,42 @@ asegurar_repo_docker() {
         | $SUDO tee /etc/apt/sources.list.d/docker.list > /dev/null
 }
 
+# Instala unicamente el plugin de Docker Compose, para el caso habitual de una
+# maquina que YA trae Docker pero con una version anterior a `docker compose`.
+# Se descarga el binario del plugin en vez de reinstalar Docker entero: son
+# unos segundos y no toca apt, que es la parte lenta y la que se bloquea con
+# el lock de dpkg. Si la descarga falla, se recurre a apt.
+instalar_compose() {
+    local arch="" url="" destino="/usr/local/lib/docker/cli-plugins"
+
+    case "$(dpkg --print-architecture)" in
+        amd64) arch="x86_64" ;;
+        arm64) arch="aarch64" ;;
+        armhf) arch="armv7"   ;;
+    esac
+
+    if [ -n "$arch" ]; then
+        url="https://github.com/docker/compose/releases/latest/download/docker-compose-linux-${arch}"
+        paso "Descargando el plugin de Compose ($arch)..."
+        if $SUDO install -m 0755 -d "$destino" \
+            && $SUDO curl -fsSL "$url" -o "$destino/docker-compose" \
+            && $SUDO chmod +x "$destino/docker-compose" \
+            && $SUDO docker compose version >/dev/null 2>&1; then
+            ok "Docker Compose instalado como plugin."
+            return 0
+        fi
+        aviso "la descarga directa no funciono; se intenta con apt."
+        $SUDO rm -f "$destino/docker-compose"
+    fi
+
+    asegurar_repo_docker
+    apt_update
+    apt_install docker-compose-plugin
+    $SUDO docker compose version >/dev/null 2>&1 \
+        || error "no se pudo instalar Docker Compose."
+    ok "Docker Compose instalado con apt."
+}
+
 # ============================================================================
 #  1. Validacion de dependencias
 # ============================================================================
@@ -224,16 +260,13 @@ if ! $SUDO docker info >/dev/null 2>&1; then
 fi
 
 # Compose es imprescindible: el despliegue usa el docker-compose.yml del repo.
+# Es habitual encontrar Docker instalado pero sin el, o con el `docker-compose`
+# antiguo (v1, con guion), que ya no se mantiene y no entiende este compose.
 if $SUDO docker compose version >/dev/null 2>&1; then
     ok "Docker Compose disponible."
 else
-    paso "Falta el plugin de Docker Compose, instalando solo ese paquete..."
-    asegurar_repo_docker
-    apt_update
-    apt_install docker-compose-plugin
-    $SUDO docker compose version >/dev/null 2>&1 \
-        || error "no se pudo instalar Docker Compose."
-    ok "Docker Compose instalado."
+    paso 'Docker esta instalado pero no trae "docker compose".'
+    instalar_compose
 fi
 
 # ---- ngrok -----------------------------------------------------------------

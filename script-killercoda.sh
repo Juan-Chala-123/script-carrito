@@ -1,588 +1,125 @@
-#!/usr/bin/env bash
-#
-# ESCENARIO 2 - Killercoda
-# Despliegue automatizado de un servicio mediante Docker Compose y Nginx.
-#
-#   Cliente -> Nginx (proxy inverso) -> contenedores del docker-compose.yml
-#
-# El script levanta el docker-compose.yml que trae el propio repositorio del
-# servicio y coloca delante un Nginx que actua como unico punto de entrada:
-#
-#     /       ->  contenedor del frontend
-#     /api/   ->  contenedor del backend
-#
-# Es parametrizable: todos los datos se solicitan durante la ejecucion, por
-# lo que sirve para cualquier proyecto con docker-compose.yml. No hay rutas,
-# puertos, nombres ni credenciales escritos en este archivo.
-#
-# Entorno objetivo: Killercoda / Ubuntu / Debian. Funciona como root o con sudo.
-#
-# Para el despliegue con publicacion externa mediante ngrok, usar
-# script-ngrok.sh
-#
-# Uso:  ./script-killercoda.sh
+#!/bin/bash
 
-set -Eeuo pipefail
+# =============================================
+# Script simple de despliegue (versión ROOT)
+# =============================================
 
-export DEBIAN_FRONTEND=noninteractive
+set -e
 
-# ============================================================================
-#  Utilidades
-# ============================================================================
+# Colores para mejor visualización
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
 
-titulo() {
-    echo ""
-    echo "======================================================================"
-    echo " $1"
-    echo "======================================================================"
-}
+echo -e "${GREEN}======================================${NC}"
+echo -e "${GREEN} Despliegue automático (ROOT)${NC}"
+echo -e "${GREEN}======================================${NC}"
 
-paso()  { echo "  -> $1"; }
-ok()    { echo "  [OK] $1"; }
-aviso() { echo "  [!] $1" >&2; }
+# Variables
+REPO_URL="https://github.com/tadeo77789/carrito.git"
+PROJECT_DIR="/root/carrito"  # Directorio para root
 
-error() {
-    echo "" >&2
-    echo "ERROR: $1" >&2
+# =============================================
+# 1. Instalar Docker si no está presente
+# =============================================
+echo -e "\n${YELLOW}[1/4] Verificando Docker...${NC}"
+
+if ! command -v docker &> /dev/null; then
+    echo "Docker no está instalado. Instalando..."
+    
+    # Desinstalar versiones antiguas
+    apt-get remove -y docker.io docker-doc docker-compose podman-docker containerd runc 2>/dev/null || true
+    
+    # Instalar dependencias
+    apt-get update -qq
+    apt-get install -y ca-certificates curl gnupg lsb-release
+    
+    # Añadir repositorio Docker
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+    chmod a+r /etc/apt/keyrings/docker.asc
+    
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+    
+    # Instalar Docker
+    apt-get update -qq
+    apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    
+    # Iniciar Docker
+    systemctl start docker
+    systemctl enable docker
+    
+    echo -e "${GREEN}Docker instalado: $(docker --version)${NC}"
+else
+    echo -e "${GREEN}Docker ya está instalado: $(docker --version)${NC}"
+fi
+
+# =============================================
+# 2. Verificar Docker Compose
+# =============================================
+echo -e "\n${YELLOW}[2/4] Verificando Docker Compose...${NC}"
+
+if ! docker compose version &> /dev/null; then
+    echo "Docker Compose no está disponible. Instalando..."
+    
+    # Descargar Docker Compose directamente
+    curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+    chmod +x /usr/local/bin/docker-compose
+    
+    echo -e "${GREEN}Docker Compose instalado: $(docker-compose --version)${NC}"
+else
+    echo -e "${GREEN}Docker Compose disponible: $(docker compose version)${NC}"
+fi
+
+# =============================================
+# 3. Clonar repositorio
+# =============================================
+echo -e "\n${YELLOW}[3/4] Preparando repositorio...${NC}"
+
+cd /root
+
+if [ -d "$PROJECT_DIR" ]; then
+    echo "El directorio $PROJECT_DIR ya existe."
+    echo "  - Usando repositorio existente"
+    cd "$PROJECT_DIR"
+    git pull --ff-only || echo "No se pudo actualizar, usando versión local"
+else
+    echo "Clonando repositorio desde $REPO_URL..."
+    git clone --depth 1 "$REPO_URL"
+    cd "$PROJECT_DIR"
+fi
+
+echo -e "${GREEN}Repositorio listo en: $PROJECT_DIR${NC}"
+
+# =============================================
+# 4. Ejecutar Docker Compose
+# =============================================
+echo -e "\n${YELLOW}[4/4] Desplegando con Docker Compose...${NC}"
+
+# Verificar que existe docker-compose.yml
+if [ ! -f "docker-compose.yml" ] && [ ! -f "compose.yml" ]; then
+    echo -e "${RED}Error: No se encontró docker-compose.yml en el repositorio${NC}"
     exit 1
-}
-
-trap 'error "el script fallo en la linea $LINENO"' ERR
-
-# Pregunta un dato. El prompt de `read -p` se escribe en stderr, por eso la
-# respuesta se puede capturar con $(...) sin arrastrar el texto del prompt.
-preguntar() {
-    local prompt="$1" def="${2:-}" resp=""
-    if [ -n "$def" ]; then
-        read -rp "  $prompt [$def]: " resp || true
-        echo "${resp:-$def}"
-    else
-        while true; do
-            read -rp "  $prompt: " resp || true
-            [ -n "$resp" ] && break
-            aviso "este dato es obligatorio."
-        done
-        echo "$resp"
-    fi
-}
-
-preguntar_puerto() {
-    local prompt="$1" def="${2:-}" p=""
-    while true; do
-        p="$(preguntar "$prompt" "$def")"
-        if [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ]; then
-            echo "$p"
-            return 0
-        fi
-        aviso "'$p' no es un puerto valido (1-65535)."
-    done
-}
-
-puerto_ocupado() {
-    if command -v ss >/dev/null 2>&1; then
-        ss -ltn "sport = :$1" 2>/dev/null | grep -q LISTEN
-    else
-        return 1
-    fi
-}
-
-# ---- apt --------------------------------------------------------------------
-# DPkg::Lock::Timeout evita el cuelgue silencioso cuando unattended-upgrades
-# tiene tomado el lock de dpkg al arrancar la maquina.
-APT_OPTS=(-o DPkg::Lock::Timeout=300 -o Acquire::Retries=3)
-
-# Killercoda y Ubuntu lanzan apt y unattended-upgrades al arrancar la maquina.
-# Si se llama a apt mientras tanto, falla con "Could not get lock". En vez de
-# abortar, se espera a que el otro proceso termine informando del progreso.
-esperar_apt() {
-    local espera=0 aviso_dado="no"
-
-    command -v pgrep >/dev/null 2>&1 || return 0
-
-    while pgrep -x 'apt|apt-get|dpkg|unattended-upgr' >/dev/null 2>&1; do
-        if [ "$aviso_dado" = "no" ]; then
-            paso "Otro proceso de apt esta en ejecucion. Esperando a que termine..."
-            paso "(es normal en una maquina recien arrancada)"
-            aviso_dado="si"
-        fi
-        if [ "$espera" -ge 600 ]; then
-            error "apt sigue bloqueado tras 10 minutos. Revisa con: ps aux | grep apt"
-        fi
-        sleep 5
-        espera=$((espera + 5))
-        if [ $((espera % 30)) -eq 0 ]; then
-            echo "     ... $espera s"
-        fi
-    done
-
-    if [ "$aviso_dado" = "si" ]; then
-        ok "El otro proceso de apt termino, continuando."
-    fi
-}
-
-apt_update()  { esperar_apt; $SUDO apt-get update -q "${APT_OPTS[@]}"; }
-apt_install() { esperar_apt; $SUDO apt-get install -y -q --no-install-recommends "${APT_OPTS[@]}" "$@"; }
-
-asegurar_repo_docker() {
-    if [ -f /etc/apt/sources.list.d/docker.list ]; then
-        return 0
-    fi
-    paso "Anadiendo el repositorio oficial de Docker..."
-    $SUDO install -m 0755 -d /etc/apt/keyrings
-    $SUDO curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-        -o /etc/apt/keyrings/docker.asc
-    $SUDO chmod a+r /etc/apt/keyrings/docker.asc
-
-    # shellcheck disable=SC1091
-    local codename
-    codename="$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")"
-    [ -n "$codename" ] || error "no se pudo determinar el codename de la distribucion."
-
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $codename stable" \
-        | $SUDO tee /etc/apt/sources.list.d/docker.list > /dev/null
-}
-
-# Instala unicamente el plugin de Docker Compose, para el caso habitual de una
-# maquina que YA trae Docker pero con una version anterior a `docker compose`.
-# Se descarga el binario del plugin en vez de reinstalar Docker entero: son
-# unos segundos y no toca apt, que es la parte lenta y la que se bloquea con
-# el lock de dpkg. Si la descarga falla, se recurre a apt.
-instalar_compose() {
-    local arch="" url="" destino="/usr/local/lib/docker/cli-plugins"
-
-    case "$(dpkg --print-architecture)" in
-        amd64) arch="x86_64" ;;
-        arm64) arch="aarch64" ;;
-        armhf) arch="armv7"   ;;
-    esac
-
-    if [ -n "$arch" ]; then
-        url="https://github.com/docker/compose/releases/latest/download/docker-compose-linux-${arch}"
-        paso "Descargando el plugin de Compose ($arch)..."
-        if $SUDO install -m 0755 -d "$destino" \
-            && $SUDO curl -fsSL "$url" -o "$destino/docker-compose" \
-            && $SUDO chmod +x "$destino/docker-compose" \
-            && $SUDO docker compose version >/dev/null 2>&1; then
-            ok "Docker Compose instalado como plugin."
-            return 0
-        fi
-        aviso "la descarga directa no funciono; se intenta con apt."
-        $SUDO rm -f "$destino/docker-compose"
-    fi
-
-    asegurar_repo_docker
-    apt_update
-    apt_install docker-compose-plugin
-    $SUDO docker compose version >/dev/null 2>&1 \
-        || error "no se pudo instalar Docker Compose."
-    ok "Docker Compose instalado con apt."
-}
-
-# ============================================================================
-#  1. Validacion de dependencias
-# ============================================================================
-
-titulo "1. Validacion de dependencias"
-
-if [ "$(id -u)" -eq 0 ]; then
-    SUDO=""
-    paso "Ejecutando como root."
-else
-    command -v sudo >/dev/null 2>&1 || error "no eres root y sudo no esta instalado."
-    SUDO="sudo"
-    paso "Ejecutando como $(id -un), se usara sudo."
-    sudo -v
 fi
 
-command -v apt-get >/dev/null 2>&1 || error "este script requiere apt-get (Ubuntu/Debian)."
+# Detener contenedores anteriores (si existen)
+docker compose down 2>/dev/null || true
 
-paso "Verificando utilidades base..."
-
-# Solo se llama a apt si falta algo: en una maquina que ya las tiene, esto
-# ahorra el `apt-get update` completo.
-FALTANTES=()
-for p in ca-certificates curl git iproute2; do
-    dpkg -s "$p" >/dev/null 2>&1 || FALTANTES+=("$p")
-done
-
-if [ ${#FALTANTES[@]} -eq 0 ]; then
-    ok "Utilidades base ya presentes."
-else
-    paso "Instalando: ${FALTANTES[*]}"
-    apt_update
-    apt_install "${FALTANTES[@]}"
-    ok "Utilidades base instaladas."
-fi
-
-# ---- Docker ----------------------------------------------------------------
-# Killercoda y muchas imagenes de Ubuntu ya traen Docker: si esta, no se
-# reinstala nada, que es lo que hacia que este paso tardara varios minutos.
-
-if command -v docker >/dev/null 2>&1; then
-    ok "Docker ya esta instalado, se omite la instalacion."
-else
+# Construir y levantar
+echo "Construyendo y levantando contenedores..."
+if docker compose up --build -d; then
+    echo -e "\n${GREEN}======================================${NC}"
+    echo -e "${GREEN}✅ ¡Despliegue exitoso!${NC}"
+    echo -e "${GREEN}======================================${NC}"
     echo ""
-    aviso "Docker no esta instalado. La descarga puede tardar varios minutos."
-    aviso "Vera el progreso de apt; no interrumpa el proceso."
+    echo "Contenedores en ejecución:"
+    docker compose ps
     echo ""
-
-    # Solo se desinstala lo que realmente este puesto.
-    CONFLICTOS=()
-    for p in docker.io docker-doc docker-compose docker-compose-v2 \
-             podman-docker containerd runc; do
-        if dpkg -s "$p" >/dev/null 2>&1; then CONFLICTOS+=("$p"); fi
-    done
-    if [ ${#CONFLICTOS[@]} -gt 0 ]; then
-        paso "Eliminando paquetes en conflicto: ${CONFLICTOS[*]}"
-        esperar_apt
-        $SUDO apt-get remove -y -q "${APT_OPTS[@]}" "${CONFLICTOS[@]}" || true
-    fi
-
-    asegurar_repo_docker
-    paso "Instalando Docker..."
-    apt_update
-    apt_install docker-ce docker-ce-cli containerd.io \
-                docker-buildx-plugin docker-compose-plugin
-
-    ok "Docker instalado."
-fi
-
-# El demonio debe estar corriendo (en Killercoda no siempre arranca solo).
-if ! $SUDO docker info >/dev/null 2>&1; then
-    paso "Iniciando el demonio de Docker..."
-    $SUDO systemctl start docker >/dev/null 2>&1 \
-        || $SUDO service docker start >/dev/null 2>&1 \
-        || true
-    $SUDO docker info >/dev/null 2>&1 || error "el demonio de Docker no esta disponible."
-fi
-
-# Compose es imprescindible: el despliegue usa el docker-compose.yml del repo.
-# Es habitual encontrar Docker instalado pero sin el, o con el `docker-compose`
-# antiguo (v1, con guion), que ya no se mantiene y no entiende este compose.
-if $SUDO docker compose version >/dev/null 2>&1; then
-    ok "Docker Compose disponible."
+    echo "Para ver logs: docker compose logs -f"
+    echo "Para detener: docker compose down"
 else
-    paso 'Docker esta instalado pero no trae "docker compose".'
-    instalar_compose
+    echo -e "\n${RED}❌ Error al levantar los contenedores${NC}"
+    echo "Ver logs con: docker compose logs"
+    exit 1
 fi
-
-echo "  Docker:  $($SUDO docker --version)"
-echo "  Compose: $($SUDO docker compose version --short 2>/dev/null || echo desconocida)"
-
-# ============================================================================
-#  2. Datos del despliegue
-# ============================================================================
-
-titulo "2. Datos del despliegue"
-
-echo "  Responde los siguientes datos. Entre corchetes aparece el valor por"
-echo "  defecto: pulsa Enter para aceptarlo."
-echo ""
-
-PROJECT="$(preguntar        'Nombre del proyecto' 'carrito')"
-REPO_URL="$(preguntar       'URL del repositorio del servicio')"
-COMPOSE_SUBDIR="$(preguntar 'Ruta del docker-compose.yml dentro del repo' '.')"
-PROXY_PORT="$(preguntar_puerto 'Puerto del proxy inverso (Nginx)' '80')"
-
-echo ""
-echo "  Ahora los servicios del docker-compose.yml que Nginx debe publicar."
-echo "  Son los nombres tal como aparecen bajo 'services:'."
-echo ""
-
-FRONT_SVC="$(preguntar  'Servicio del frontend (vacio si no hay)' 'frontend')"
-[ "$FRONT_SVC" = "vacio" ] && FRONT_SVC=""
-if [ -n "$FRONT_SVC" ]; then
-    FRONT_PORT="$(preguntar_puerto "Puerto interno de $FRONT_SVC" '80')"
-else
-    FRONT_PORT=""
-fi
-
-BACK_SVC="$(preguntar        'Servicio del backend' 'backend')"
-BACK_PORT="$(preguntar_puerto "Puerto interno de $BACK_SVC" '3000')"
-API_PREFIX="$(preguntar      'Prefijo de las rutas del backend' '/api/')"
-
-# Nginx exige que el prefijo empiece y termine en /
-[[ "$API_PREFIX" == /* ]]  || API_PREFIX="/$API_PREFIX"
-[[ "$API_PREFIX" == */ ]]  || API_PREFIX="$API_PREFIX/"
-
-NGINX_CONTAINER="${PROJECT}-proxy"
-
-if puerto_ocupado "$PROXY_PORT"; then
-    aviso "el puerto $PROXY_PORT ya esta en uso; el arranque de Nginx puede fallar."
-fi
-
-TARGET_USER="${SUDO_USER:-$(id -un)}"
-TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
-[ -n "$TARGET_HOME" ] || TARGET_HOME="$HOME"
-
-WORKDIR="$TARGET_HOME/despliegue-$PROJECT"
-SRC_DIR="$WORKDIR/src"
-NGINX_CONF="$WORKDIR/nginx.conf"
-
-mkdir -p "$WORKDIR"
-
-# ============================================================================
-#  3. Clonado del repositorio
-# ============================================================================
-
-titulo "3. Codigo del servicio"
-
-if [ -d "$SRC_DIR/.git" ]; then
-    paso "El codigo ya existe, actualizando..."
-    git -C "$SRC_DIR" pull --ff-only || aviso "no se pudo actualizar; se usa la copia local."
-else
-    rm -rf "$SRC_DIR"
-    paso "Clonando $REPO_URL ..."
-    git clone --depth 1 "$REPO_URL" "$SRC_DIR"
-fi
-
-COMPOSE_DIR="$SRC_DIR/$COMPOSE_SUBDIR"
-[ -d "$COMPOSE_DIR" ] || error "la ruta '$COMPOSE_SUBDIR' no existe dentro del repositorio."
-
-COMPOSE_FILE=""
-for f in compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do
-    if [ -f "$COMPOSE_DIR/$f" ]; then
-        COMPOSE_FILE="$COMPOSE_DIR/$f"
-        break
-    fi
-done
-[ -n "$COMPOSE_FILE" ] || error "no se encontro un archivo compose en $COMPOSE_DIR."
-
-ok "Usando $COMPOSE_FILE"
-
-compose() {
-    $SUDO docker compose -p "$PROJECT" -f "$COMPOSE_FILE" \
-        --project-directory "$COMPOSE_DIR" "$@"
-}
-
-# ============================================================================
-#  4. Variables de entorno
-# ============================================================================
-
-titulo "4. Variables de entorno del servicio"
-
-echo "  Se escriben en un archivo .env junto al docker-compose.yml, que Compose"
-echo "  lee automaticamente. Formato CLAVE=VALOR, una por linea."
-echo "  Ejemplos: DB_USER=admin   DB_PASSWORD=secreto   DB_NAME=tienda"
-echo "  Deja la linea vacia y pulsa Enter para terminar (se usaran los valores"
-echo "  por defecto del docker-compose.yml)."
-echo ""
-
-ENV_FILE="$COMPOSE_DIR/.env"
-
-# El archivo puede contener contrasenas: se crea con permisos restrictivos.
-: > "$ENV_FILE"
-chmod 600 "$ENV_FILE"
-
-n_vars=0
-while true; do
-    read -rp "  VAR $((n_vars + 1)): " linea || true
-    [ -z "$linea" ] && break
-    if [[ "$linea" =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ ]]; then
-        echo "$linea" >> "$ENV_FILE"
-        n_vars=$((n_vars + 1))
-    else
-        aviso "formato invalido, usa CLAVE=VALOR."
-    fi
-done
-
-if [ "$n_vars" -eq 0 ]; then
-    rm -f "$ENV_FILE"
-    ok "Sin variables: se usan los valores por defecto del compose."
-else
-    ok "$n_vars variable(s) guardadas en $ENV_FILE (permisos 600)."
-fi
-
-# ============================================================================
-#  5. Despliegue con Docker Compose
-# ============================================================================
-
-titulo "5. Despliegue con Docker Compose"
-
-echo ""
-aviso "La construccion de las imagenes puede tardar varios minutos la"
-aviso "primera vez (descarga de imagenes base y dependencias)."
-echo ""
-
-paso "Levantando los servicios..."
-compose up -d --build --remove-orphans
-
-ok "Servicios levantados."
-echo ""
-compose ps
-
-# ============================================================================
-#  6. Descubrimiento de contenedores y red
-# ============================================================================
-
-titulo "6. Contenedores y red"
-
-# El nombre real del contenedor y de la red los decide Compose (prefijo de
-# proyecto incluido), asi que se consultan en vez de suponerlos.
-nombre_contenedor() {
-    local svc="$1" cid=""
-    cid="$(compose ps -q "$svc" 2>/dev/null | head -n 1)"
-    [ -n "$cid" ] || error "el servicio '$svc' no existe o no esta levantado."
-    $SUDO docker inspect -f '{{.Name}}' "$cid" | sed 's#^/##'
-}
-
-red_contenedor() {
-    local svc="$1" cid=""
-    cid="$(compose ps -q "$svc" 2>/dev/null | head -n 1)"
-    $SUDO docker inspect \
-        -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$cid" \
-        | awk '{print $1}'
-}
-
-BACK_CONTAINER="$(nombre_contenedor "$BACK_SVC")"
-NETWORK_NAME="$(red_contenedor "$BACK_SVC")"
-ok "Backend:  $BACK_CONTAINER (red $NETWORK_NAME)"
-
-FRONT_CONTAINER=""
-if [ -n "$FRONT_SVC" ]; then
-    FRONT_CONTAINER="$(nombre_contenedor "$FRONT_SVC")"
-    ok "Frontend: $FRONT_CONTAINER"
-fi
-
-[ -n "$NETWORK_NAME" ] || error "no se pudo determinar la red de Compose."
-
-# ============================================================================
-#  7. Nginx como proxy inverso
-# ============================================================================
-
-titulo "7. Proxy inverso (Nginx)"
-
-# Nginx se une a la red de Compose y resuelve los contenedores por su nombre.
-# proxy_pass sin ruta al final conserva la URI original, que es lo que el
-# backend espera recibir.
-{
-    echo "server {"
-    echo "    listen 80;"
-    echo "    server_name _;"
-    echo ""
-    echo "    location ${API_PREFIX} {"
-    echo "        proxy_pass http://${BACK_CONTAINER}:${BACK_PORT};"
-    echo "        proxy_http_version 1.1;"
-    echo "        proxy_set_header Host              \$host;"
-    echo "        proxy_set_header X-Real-IP         \$remote_addr;"
-    echo "        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;"
-    echo "        proxy_set_header X-Forwarded-Proto \$scheme;"
-    echo "        proxy_connect_timeout 30s;"
-    echo "        proxy_read_timeout    60s;"
-    echo "    }"
-    echo ""
-    echo "    location / {"
-    if [ -n "$FRONT_CONTAINER" ]; then
-        echo "        proxy_pass http://${FRONT_CONTAINER}:${FRONT_PORT};"
-    else
-        echo "        proxy_pass http://${BACK_CONTAINER}:${BACK_PORT};"
-    fi
-    echo "        proxy_http_version 1.1;"
-    echo "        proxy_set_header Host              \$host;"
-    echo "        proxy_set_header X-Real-IP         \$remote_addr;"
-    echo "        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;"
-    echo "        proxy_set_header X-Forwarded-Proto \$scheme;"
-    echo "        proxy_set_header Upgrade    \$http_upgrade;"
-    echo "        proxy_set_header Connection \"upgrade\";"
-    echo "        proxy_connect_timeout 30s;"
-    echo "        proxy_read_timeout    60s;"
-    echo "    }"
-    echo "}"
-} > "$NGINX_CONF"
-
-ok "Configuracion generada en $NGINX_CONF"
-
-$SUDO docker rm -f "$NGINX_CONTAINER" >/dev/null 2>&1 || true
-
-paso "Iniciando Nginx en el puerto $PROXY_PORT ..."
-$SUDO docker run -d \
-    --name "$NGINX_CONTAINER" \
-    --network "$NETWORK_NAME" \
-    --restart unless-stopped \
-    -p "${PROXY_PORT}:80" \
-    -v "$NGINX_CONF:/etc/nginx/conf.d/default.conf:ro" \
-    nginx:alpine >/dev/null
-
-# Si la configuracion es invalida el contenedor arranca y muere enseguida.
-sleep 2
-if [ "$($SUDO docker inspect -f '{{.State.Running}}' "$NGINX_CONTAINER")" != "true" ]; then
-    $SUDO docker logs "$NGINX_CONTAINER" >&2 || true
-    error "Nginx no arranco. Revisa $NGINX_CONF"
-fi
-
-ok "Proxy inverso escuchando en el puerto $PROXY_PORT."
-
-# ============================================================================
-#  8. Validacion del despliegue
-# ============================================================================
-
-titulo "8. Validacion del despliegue"
-
-# Se usa el codigo de salida de curl, no su salida: ante un fallo de conexion
-# curl imprime "000" Y ademas sale con error, asi que un `|| echo 000` daria
-# "000000" y el despliegue se reportaria como correcto sin serlo.
-esperar_http() {
-    local url="$1" etiqueta="$2" intentos="${3:-30}" codigo=""
-    paso "Validando $etiqueta ($url) ..."
-    for _ in $(seq 1 "$intentos"); do
-        if codigo="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "$url" 2>/dev/null)"; then
-            ok "$etiqueta responde (HTTP $codigo)."
-            return 0
-        fi
-        sleep 2
-    done
-    aviso "$etiqueta no respondio tras $((intentos * 2))s."
-    return 1
-}
-
-PROXY_OK="si"
-API_OK="si"
-esperar_http "http://127.0.0.1:${PROXY_PORT}/"            "el proxy inverso"      || PROXY_OK="no"
-esperar_http "http://127.0.0.1:${PROXY_PORT}${API_PREFIX}" "el backend via proxy" || API_OK="no"
-
-if [ "$PROXY_OK" = "no" ] || [ "$API_OK" = "no" ]; then
-    aviso "revisa los logs con:"
-    aviso "  docker logs $NGINX_CONTAINER"
-    aviso "  docker compose -p $PROJECT logs"
-fi
-
-# ============================================================================
-#  9. Resumen
-# ============================================================================
-
-titulo "Despliegue finalizado"
-
-cat <<RESUMEN
-
-  Proyecto ............ $PROJECT
-  Compose ............. $COMPOSE_FILE
-  Proxy inverso ....... $NGINX_CONTAINER (puerto $PROXY_PORT)
-  Red Docker .......... $NETWORK_NAME
-  Variables cargadas .. $n_vars
-
-  Enrutamiento de Nginx:
-    /             -> ${FRONT_CONTAINER:-$BACK_CONTAINER}:${FRONT_PORT:-$BACK_PORT}
-    ${API_PREFIX}         -> ${BACK_CONTAINER}:${BACK_PORT}
-
-  Acceso a traves del proxy ....... http://localhost:$PROXY_PORT
-
-  Validaciones:  proxy=$PROXY_OK  api=$API_OK
-
-  En Killercoda, para abrir el puerto $PROXY_PORT desde el navegador usa el
-  menu "Traffic / Ports" de la interfaz y selecciona ese puerto.
-
-  Archivos generados en $WORKDIR
-    src/         codigo clonado del servicio
-    nginx.conf   configuracion del proxy inverso
-
-  Comandos utiles:
-    docker compose -p $PROJECT ps
-    docker compose -p $PROJECT logs -f
-    docker logs -f $NGINX_CONTAINER
-    curl -i http://127.0.0.1:$PROXY_PORT${API_PREFIX}
-
-  Para detener todo:
-    docker rm -f $NGINX_CONTAINER
-    docker compose -p $PROJECT -f $COMPOSE_FILE down
-
-RESUMEN

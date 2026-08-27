@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
 #
-# Despliegue y publicacion de un servicio mediante Docker, Nginx y ngrok.
+# ESCENARIO 2 - Killercoda
+# Despliegue automatizado de un servicio mediante Docker y Nginx.
 #
-#   Cliente -> ngrok -> Nginx (proxy inverso) -> Docker -> Servicio
+#   Cliente -> Nginx (proxy inverso) -> Docker -> Servicio
 #
 # El script es parametrizable: todos los datos del despliegue se solicitan
 # durante la ejecucion, por lo que sirve para cualquier servicio que tenga
-# un Dockerfile. Ningun dato del despliegue ni el token de ngrok quedan
-# escritos en este archivo.
+# un Dockerfile. No hay rutas, puertos, nombres ni credenciales escritos
+# en este archivo.
 #
 # Entorno objetivo: Killercoda / Ubuntu / Debian. Funciona como root o con sudo.
 #
-# Uso:  ./script.sh
+# Para el despliegue con publicacion externa mediante ngrok, usar
+# script-ngrok.sh
+#
+# Uso:  ./script-killercoda.sh
 
 set -Eeuo pipefail
 
@@ -142,29 +146,8 @@ fi
 
 echo "  Docker:  $($SUDO docker --version)"
 
-# ---- ngrok -----------------------------------------------------------------
-
-if command -v ngrok >/dev/null 2>&1; then
-    ok "ngrok ya esta instalado."
-else
-    paso "Instalando ngrok..."
-    case "$(dpkg --print-architecture)" in
-        amd64) NGROK_ARCH="amd64" ;;
-        arm64) NGROK_ARCH="arm64" ;;
-        *)     error "arquitectura no soportada para ngrok: $(dpkg --print-architecture)" ;;
-    esac
-    curl -fsSL "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-${NGROK_ARCH}.tgz" \
-        -o /tmp/ngrok.tgz
-    $SUDO tar -xzf /tmp/ngrok.tgz -C /usr/local/bin ngrok
-    $SUDO chmod +x /usr/local/bin/ngrok
-    rm -f /tmp/ngrok.tgz
-    ok "ngrok instalado."
-fi
-
-echo "  ngrok:   $(ngrok version)"
-
 # ============================================================================
-#  2. Datos del servicio (seccion 7.1 de la actividad)
+#  2. Datos del servicio
 # ============================================================================
 
 titulo "2. Datos del servicio"
@@ -196,7 +179,6 @@ WORKDIR="$TARGET_HOME/despliegue-$SERVICE_NAME"
 SRC_DIR="$WORKDIR/src"
 ENV_FILE="$WORKDIR/.env"
 NGINX_CONF="$WORKDIR/nginx.conf"
-NGROK_LOG="$WORKDIR/ngrok.log"
 
 mkdir -p "$WORKDIR"
 
@@ -236,31 +218,10 @@ else
 fi
 
 # ============================================================================
-#  4. Datos de ngrok (seccion 7.2 de la actividad)
+#  4. Construccion de la imagen
 # ============================================================================
 
-titulo "4. Datos de ngrok"
-
-# El token se lee con -s: no se muestra al digitarlo, no se imprime nunca y
-# no queda en el codigo ni en el .env. ngrok lo guarda en su propio archivo
-# de configuracion del usuario.
-NGROK_TOKEN=""
-while [ -z "$NGROK_TOKEN" ]; do
-    read -rsp "  Token de autenticacion de ngrok (no se mostrara): " NGROK_TOKEN || true
-    echo ""
-    [ -z "$NGROK_TOKEN" ] && aviso "el token es obligatorio."
-done
-ok "Token recibido (oculto)."
-
-NGROK_PORT="$(preguntar_puerto 'Puerto que se publicara mediante ngrok' "$PROXY_PORT")"
-NGROK_DOMAIN="$(preguntar 'Dominio reservado de ngrok (Enter para uno aleatorio)' 'ninguno')"
-[ "$NGROK_DOMAIN" = "ninguno" ] && NGROK_DOMAIN=""
-
-# ============================================================================
-#  5. Construccion de la imagen
-# ============================================================================
-
-titulo "5. Construccion de la imagen Docker"
+titulo "4. Construccion de la imagen Docker"
 
 if [ -d "$SRC_DIR/.git" ]; then
     paso "El codigo ya existe, actualizando..."
@@ -280,10 +241,10 @@ $SUDO docker build -t "$IMAGE_NAME" "$CONTEXT_DIR"
 ok "Imagen $IMAGE_NAME construida."
 
 # ============================================================================
-#  6. Red Docker
+#  5. Red Docker
 # ============================================================================
 
-titulo "6. Red Docker"
+titulo "5. Red Docker"
 
 if $SUDO docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
     ok "La red $NETWORK_NAME ya existe."
@@ -293,10 +254,10 @@ else
 fi
 
 # ============================================================================
-#  7. Contenedor del servicio
+#  6. Contenedor del servicio
 # ============================================================================
 
-titulo "7. Contenedor del servicio"
+titulo "6. Contenedor del servicio"
 
 # Se elimina cualquier contenedor previo con el mismo nombre para que el
 # script se pueda reejecutar las veces que haga falta.
@@ -316,10 +277,10 @@ $SUDO docker run "${run_args[@]}" "$IMAGE_NAME" >/dev/null
 ok "Contenedor $CONTAINER_NAME en ejecucion."
 
 # ============================================================================
-#  8. Nginx como proxy inverso
+#  7. Nginx como proxy inverso
 # ============================================================================
 
-titulo "8. Proxy inverso (Nginx)"
+titulo "7. Proxy inverso (Nginx)"
 
 # Nginx resuelve el nombre del contenedor por DNS dentro de la red Docker.
 cat > "$NGINX_CONF" <<NGINXCONF
@@ -361,10 +322,10 @@ $SUDO docker run -d \
 ok "Proxy inverso escuchando en el puerto $PROXY_PORT."
 
 # ============================================================================
-#  9. Validacion del servicio y del proxy
+#  8. Validacion del despliegue
 # ============================================================================
 
-titulo "9. Validacion del despliegue"
+titulo "8. Validacion del despliegue"
 
 # Se usa el codigo de salida de curl, no su salida: ante un fallo de conexion
 # curl imprime "000" Y ademas sale con error, asi que un `|| echo 000` daria
@@ -392,64 +353,7 @@ esperar_http "http://127.0.0.1:${PROXY_PORT}" "el proxy inverso" || PROXY_OK="no
 [ "$PROXY_OK" = "no" ]    && aviso "revisa los logs con: docker logs $NGINX_CONTAINER"
 
 # ============================================================================
-#  10. Tunel ngrok
-# ============================================================================
-
-titulo "10. Publicacion mediante ngrok"
-
-paso "Registrando el token..."
-ngrok config add-authtoken "$NGROK_TOKEN" >/dev/null
-unset NGROK_TOKEN   # ya no se necesita en memoria
-ok "Token registrado en la configuracion de ngrok."
-
-pkill -f 'ngrok (http|start)' >/dev/null 2>&1 || true
-sleep 1
-
-ngrok_args=(http "$NGROK_PORT" --log=stdout --log-format=logfmt)
-[ -n "$NGROK_DOMAIN" ] && ngrok_args+=(--domain="$NGROK_DOMAIN")
-
-paso "Abriendo el tunel hacia el puerto $NGROK_PORT ..."
-nohup ngrok "${ngrok_args[@]}" > "$NGROK_LOG" 2>&1 &
-NGROK_PID=$!
-
-# La URL publica se consulta a la API local del agente (puerto 4040).
-PUBLIC_URL=""
-for _ in $(seq 1 30); do
-    if ! kill -0 "$NGROK_PID" 2>/dev/null; then
-        echo ""
-        tail -n 20 "$NGROK_LOG" >&2
-        error "el agente de ngrok termino inesperadamente (ver $NGROK_LOG)."
-    fi
-    PUBLIC_URL="$(curl -s --max-time 3 http://127.0.0.1:4040/api/tunnels \
-        | grep -o '"public_url":"https:[^"]*"' \
-        | head -n 1 | cut -d'"' -f4 || true)"
-    [ -n "$PUBLIC_URL" ] && break
-    sleep 2
-done
-
-if [ -z "$PUBLIC_URL" ]; then
-    tail -n 20 "$NGROK_LOG" >&2
-    error "no se pudo obtener la URL publica de ngrok."
-fi
-ok "Tunel establecido (PID $NGROK_PID)."
-
-# ---- Validacion de la publicacion externa ----------------------------------
-
-paso "Validando el acceso externo ..."
-PUBLICA_OK="no"
-for _ in $(seq 1 10); do
-    if codigo="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 \
-            -H 'ngrok-skip-browser-warning: true' "$PUBLIC_URL" 2>/dev/null)"; then
-        ok "La URL publica responde (HTTP $codigo)."
-        PUBLICA_OK="si"
-        break
-    fi
-    sleep 2
-done
-[ "$PUBLICA_OK" = "si" ] || aviso "la URL publica no respondio; revisa $NGROK_LOG"
-
-# ============================================================================
-#  11. Resumen
+#  9. Resumen
 # ============================================================================
 
 titulo "Despliegue finalizado"
@@ -463,31 +367,28 @@ cat <<RESUMEN
   Proxy inverso ....... $NGINX_CONTAINER (puerto $PROXY_PORT)
   Variables cargadas .. $n_vars
 
-  Flujo:  Cliente -> ngrok -> Nginx:$PROXY_PORT -> $CONTAINER_NAME:$APP_PORT
+  Flujo:  Cliente -> Nginx:$PROXY_PORT -> $CONTAINER_NAME:$APP_PORT
 
   Acceso directo al servicio ...... http://localhost:$APP_PORT
   Acceso a traves del proxy ....... http://localhost:$PROXY_PORT
-  URL PUBLICA (ngrok) ............. $PUBLIC_URL
 
-  Validaciones:  servicio=$SERVICIO_OK  proxy=$PROXY_OK  publica=$PUBLICA_OK
+  Validaciones:  servicio=$SERVICIO_OK  proxy=$PROXY_OK
+
+  En Killercoda, para abrir el puerto $PROXY_PORT desde el navegador usa el
+  menu "Traffic / Ports" de la interfaz y selecciona ese puerto.
 
   Archivos generados en $WORKDIR
     .env         variables de entorno (permisos 600)
     nginx.conf   configuracion del proxy inverso
-    ngrok.log    log del tunel
 
   Comandos utiles:
     docker ps
     docker logs -f $CONTAINER_NAME
     docker logs -f $NGINX_CONTAINER
-    tail -f $NGROK_LOG
-    curl http://127.0.0.1:4040/api/tunnels
+    curl -I http://127.0.0.1:$PROXY_PORT
 
   Para detener todo:
-    kill $NGROK_PID
     docker rm -f $CONTAINER_NAME $NGINX_CONTAINER
     docker network rm $NETWORK_NAME
-
-  El tunel seguira activo mientras esta terminal permanezca abierta.
 
 RESUMEN

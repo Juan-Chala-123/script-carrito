@@ -1,13 +1,23 @@
-# Script de despliegue: Docker + Nginx (proxy inverso) + ngrok
+# Scripts de despliegue: Docker + Nginx (proxy inverso) + ngrok
 
-Script de automatización para desplegar y publicar un servicio de software
-en un entorno Linux limpio (Killercoda, Ubuntu o Debian).
+Actividad de aprendizaje: despliegue y publicación de un servicio mediante
+Docker, proxy inverso y ngrok.
 
-Todos los datos del despliegue se solicitan durante la ejecución, por lo que
-el mismo script sirve para cualquier servicio que disponga de un `Dockerfile`.
-No hay rutas, puertos, nombres ni credenciales escritos en el código.
+El repositorio contiene **dos scripts**, uno por escenario:
+
+| Script | Escenario | Publicación externa |
+| --- | --- | --- |
+| `script-ngrok.sh` | Máquina virtual local | Sí, mediante ngrok |
+| `script-killercoda.sh` | Killercoda | No |
+
+Ambos son parametrizables: todos los datos del despliegue se solicitan durante
+la ejecución, por lo que el mismo script sirve para cualquier servicio que
+disponga de un `Dockerfile`. No hay rutas, puertos, nombres ni credenciales
+escritos en el código.
 
 ## Arquitectura
+
+### Escenario 1 — máquina virtual local (`script-ngrok.sh`)
 
 ```text
                  INTERNET
@@ -27,28 +37,59 @@ No hay rutas, puertos, nombres ni credenciales escritos en el código.
               └──────────────┘
 ```
 
+### Escenario 2 — Killercoda (`script-killercoda.sh`)
+
+```text
+                  Cliente
+                     │
+                     ▼
+              ┌──────────────┐
+              │    Nginx     │
+              │ Proxy inverso│
+              └──────┬───────┘
+                     │             red Docker interna (DNS por nombre)
+                     ▼
+              ┌──────────────┐
+              │   Servicio   │
+              └──────────────┘
+```
+
+Para acceder desde el navegador en Killercoda se usa el menú **Traffic /
+Ports** de su interfaz, seleccionando el puerto del proxy inverso.
+
 ## Requisitos
 
 - Ubuntu / Debian / Killercoda, como `root` o con un usuario con `sudo`.
 - Conexión a Internet.
 - Un repositorio git con el código del servicio y su `Dockerfile`.
-- Una cuenta de ngrok y su token de autenticación
+- Solo para `script-ngrok.sh`: cuenta de ngrok y su token de autenticación
   (https://dashboard.ngrok.com/get-started/your-authtoken).
 
-Docker, Docker Compose y ngrok los instala el propio script si no están.
+Docker, Docker Compose y ngrok los instalan los propios scripts si no están.
 
 ## Uso
 
 ```bash
 git clone https://github.com/Juan-Chala-123/script-carrito.git
 cd script-carrito
-chmod +x script.sh
-./script.sh
+chmod +x script-ngrok.sh script-killercoda.sh
 ```
 
-## Datos que solicita
+En la máquina virtual local:
 
-### Del servicio
+```bash
+./script-ngrok.sh
+```
+
+En Killercoda:
+
+```bash
+./script-killercoda.sh
+```
+
+## Datos que solicitan
+
+### Del servicio (ambos scripts)
 
 | Dato | Ejemplo | Por defecto |
 | --- | --- | --- |
@@ -60,7 +101,10 @@ chmod +x script.sh
 | Puerto interno de la aplicación | `8080` | `8080` |
 | Puerto del proxy inverso | `80` | `80` |
 
-### Variables de entorno
+El **puerto interno** debe coincidir con el que expone el `Dockerfile` del
+servicio. Si no coincide, Nginx devolverá `502 Bad Gateway`.
+
+### Variables de entorno (ambos scripts)
 
 Se introducen en formato `CLAVE=VALOR`, una por línea, y se termina con una
 línea vacía. Por ejemplo:
@@ -78,7 +122,7 @@ SPRING_PROFILES_ACTIVE=prod
 Se guardan en `~/despliegue-<servicio>/.env` con permisos `600` y se pasan al
 contenedor con `--env-file`. Cada servicio aporta las suyas.
 
-### De ngrok
+### De ngrok (solo `script-ngrok.sh`)
 
 | Dato | Notas |
 | --- | --- |
@@ -90,21 +134,28 @@ El token nunca se escribe en el código ni en el `.env`. Se entrega a
 `ngrok config add-authtoken`, que lo almacena en la configuración del usuario,
 y se borra de memoria con `unset` inmediatamente después.
 
-## Qué automatiza
+## Qué automatizan
 
-1. Validación de dependencias e instalación de Docker y ngrok.
+Pasos comunes a los dos scripts:
+
+1. Validación de dependencias e instalación de Docker.
 2. Arranque del demonio de Docker si no está activo.
 3. Clonado del repositorio y construcción de la imagen.
 4. Creación de la red Docker.
 5. Carga de las variables de entorno.
 6. Creación e inicio del contenedor del servicio.
 7. Generación del `nginx.conf` y arranque del proxy inverso.
-8. Registro del token e inicio del túnel de ngrok.
-9. Validación del servicio, del proxy y de la publicación externa.
-10. Presentación de la URL pública generada.
+8. Validación del servicio y del proxy.
 
-El script es reejecutable: elimina los contenedores previos con el mismo
-nombre y reutiliza la red y el código ya clonado.
+`script-ngrok.sh` añade además:
+
+9. Instalación de ngrok y registro del token.
+10. Apertura del túnel.
+11. Validación de la publicación externa.
+12. Presentación de la URL pública generada.
+
+Los scripts son reejecutables: eliminan los contenedores previos con el mismo
+nombre y reutilizan la red y el código ya clonado.
 
 ## Archivos generados
 
@@ -115,7 +166,7 @@ En `~/despliegue-<servicio>/`:
 | `src/` | Código clonado del servicio |
 | `.env` | Variables de entorno (permisos `600`) |
 | `nginx.conf` | Configuración del proxy inverso |
-| `ngrok.log` | Log del agente de ngrok |
+| `ngrok.log` | Log del agente de ngrok (solo `script-ngrok.sh`) |
 
 ## Verificación
 
@@ -123,30 +174,43 @@ En `~/despliegue-<servicio>/`:
 docker ps                              # contenedores activos
 docker logs -f <servicio>-app          # logs de la aplicación
 docker logs -f <servicio>-nginx        # logs del proxy
+curl -I http://127.0.0.1:<puerto-proxy>
+```
+
+Solo en el escenario con ngrok:
+
+```bash
 curl http://127.0.0.1:4040/api/tunnels # estado del túnel y URL pública
 ```
 
-El flujo completo se comprueba accediendo a la URL pública: la petición entra
-por ngrok, pasa por Nginx y llega al contenedor del servicio. Las cabeceras
-`X-Real-IP`, `X-Forwarded-For` y `X-Forwarded-Proto` que añade Nginx permiten
-evidenciar el salto por el proxy.
+El agente de ngrok expone también una interfaz web en `http://localhost:4040`
+donde se ve cada petición entrante con sus cabeceras: es la evidencia más
+directa de que la solicitud externa pasó por ngrok antes de llegar a Nginx.
+
+Las cabeceras `X-Real-IP`, `X-Forwarded-For` y `X-Forwarded-Proto` que añade
+Nginx permiten evidenciar el salto por el proxy inverso.
 
 ## Detener el despliegue
 
 ```bash
-pkill -f 'ngrok http'
 docker rm -f <servicio>-app <servicio>-nginx
 docker network rm <servicio>-net
 ```
 
-El túnel de ngrok se mantiene activo mientras la terminal siga abierta.
+Y, en el escenario con ngrok:
+
+```bash
+pkill -f 'ngrok http'
+```
 
 ## Notas
 
-- El script funciona tanto como `root` como con `sudo`; detecta el caso y
-  omite `sudo` cuando ya es root, ya que en entornos como Killercoda `sudo`
+- Los scripts funcionan tanto como `root` como con `sudo`; detectan el caso y
+  omiten `sudo` cuando ya son root, ya que en entornos como Killercoda `sudo`
   puede no estar instalado.
-- Si el puerto del proxy ya está ocupado, avisa antes de continuar.
+- Si el puerto del proxy ya está ocupado, avisan antes de continuar.
 - Con la cuenta gratuita de ngrok el navegador muestra una página intermedia
   de advertencia la primera vez. La validación interna del script la evita
   con la cabecera `ngrok-skip-browser-warning`.
+- ngrok permite un solo túnel simultáneo en el plan gratuito; el script cierra
+  cualquier agente anterior antes de abrir el suyo.

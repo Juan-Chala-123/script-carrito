@@ -81,6 +81,15 @@ puerto_ocupado() {
     fi
 }
 
+# ---- apt --------------------------------------------------------------------
+# DPkg::Lock::Timeout evita el cuelgue silencioso cuando unattended-upgrades
+# tiene tomado el lock de dpkg al arrancar la maquina: sin el, apt espera
+# indefinidamente y sin imprimir nada, que es lo que parece un script colgado.
+APT_OPTS=(-o DPkg::Lock::Timeout=300 -o Acquire::Retries=3)
+
+apt_update()  { $SUDO apt-get update -q "${APT_OPTS[@]}"; }
+apt_install() { $SUDO apt-get install -y -q --no-install-recommends "${APT_OPTS[@]}" "$@"; }
+
 # ============================================================================
 #  1. Validacion de dependencias
 # ============================================================================
@@ -99,22 +108,50 @@ fi
 
 command -v apt-get >/dev/null 2>&1 || error "este script requiere apt-get (Ubuntu/Debian)."
 
-paso "Instalando utilidades base..."
-$SUDO apt-get update -qq
-$SUDO apt-get install -y -qq ca-certificates curl git iproute2 procps >/dev/null
-ok "curl, git y utilidades disponibles."
+paso "Verificando utilidades base..."
+
+# Solo se llama a apt si falta algo: en una maquina que ya las tiene, esto
+# ahorra el `apt-get update` completo.
+FALTANTES=()
+for p in ca-certificates curl git iproute2; do
+    dpkg -s "$p" >/dev/null 2>&1 || FALTANTES+=("$p")
+done
+
+if [ ${#FALTANTES[@]} -eq 0 ]; then
+    ok "Utilidades base ya presentes."
+else
+    paso "Instalando: ${FALTANTES[*]}"
+    apt_update
+    apt_install "${FALTANTES[@]}"
+    ok "Utilidades base instaladas."
+fi
 
 # ---- Docker ----------------------------------------------------------------
+# Killercoda y muchas imagenes de Ubuntu ya traen Docker. Antes se comprobaba
+# con `docker compose version`, heredado de una version anterior del script:
+# como aqui no se usa Compose, esa condicion daba falso en maquinas que SI
+# tenian Docker y disparaba una reinstalacion completa de varios minutos.
 
-if command -v docker >/dev/null 2>&1 && $SUDO docker compose version >/dev/null 2>&1; then
-    ok "Docker ya esta instalado."
+if command -v docker >/dev/null 2>&1; then
+    ok "Docker ya esta instalado, se omite la instalacion."
 else
-    paso "Instalando Docker desde el repositorio oficial..."
+    echo ""
+    aviso "Docker no esta instalado. La descarga puede tardar varios minutos."
+    aviso "Vera el progreso de apt; no interrumpa el proceso."
+    echo ""
 
-    $SUDO apt-get remove -y -qq \
-        docker.io docker-doc docker-compose docker-compose-v2 \
-        podman-docker containerd runc >/dev/null 2>&1 || true
+    # Solo se desinstala lo que realmente este puesto.
+    CONFLICTOS=()
+    for p in docker.io docker-doc docker-compose docker-compose-v2 \
+             podman-docker containerd runc; do
+        if dpkg -s "$p" >/dev/null 2>&1; then CONFLICTOS+=("$p"); fi
+    done
+    if [ ${#CONFLICTOS[@]} -gt 0 ]; then
+        paso "Eliminando paquetes en conflicto: ${CONFLICTOS[*]}"
+        $SUDO apt-get remove -y -q "${APT_OPTS[@]}" "${CONFLICTOS[@]}" || true
+    fi
 
+    paso "Anadiendo el repositorio oficial de Docker..."
     $SUDO install -m 0755 -d /etc/apt/keyrings
     $SUDO curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
         -o /etc/apt/keyrings/docker.asc
@@ -127,10 +164,11 @@ else
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $codename stable" \
         | $SUDO tee /etc/apt/sources.list.d/docker.list > /dev/null
 
-    $SUDO apt-get update -qq
-    $SUDO apt-get install -y -qq \
-        docker-ce docker-ce-cli containerd.io \
-        docker-buildx-plugin docker-compose-plugin >/dev/null
+    # Solo lo imprescindible: el script usa `docker build` y `docker run`,
+    # no Docker Compose, asi que docker-compose-plugin no se instala.
+    paso "Instalando Docker..."
+    apt_update
+    apt_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin
 
     ok "Docker instalado."
 fi

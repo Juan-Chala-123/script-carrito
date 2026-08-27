@@ -65,7 +65,12 @@ Ports** de su interfaz, seleccionando el puerto del proxy inverso.
 - Solo para `script-ngrok.sh`: cuenta de ngrok y su token de autenticación
   (https://dashboard.ngrok.com/get-started/your-authtoken).
 
-Docker, Docker Compose y ngrok los instalan los propios scripts si no están.
+Docker y ngrok los instalan los propios scripts si no están. Si la máquina ya
+trae Docker —como los entornos de Killercoda— la instalación se omite por
+completo y el despliegue arranca en segundos.
+
+No se instala Docker Compose: los scripts usan `docker build` y `docker run`
+directamente, así que no hace falta.
 
 ## Uso
 

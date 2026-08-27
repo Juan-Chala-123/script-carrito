@@ -3,8 +3,11 @@
 # Instala Docker + Docker Compose y despliega el proyecto "carrito".
 # Probado en Ubuntu/Debian (usa apt-get y el repositorio oficial de Docker).
 #
-# Uso:  ./script.sh          (como usuario normal con permisos de sudo)
-#       ./script.sh -d       (levanta los contenedores en segundo plano)
+# Funciona tanto como root (root directo, contenedor, VPS) como con un
+# usuario normal que tenga permisos de sudo.
+#
+# Uso:  ./script.sh          despliega en primer plano (logs en pantalla)
+#       ./script.sh -d       despliega en segundo plano
 
 set -Eeuo pipefail
 
@@ -12,9 +15,13 @@ REPO_URL="https://github.com/tadeo77789/carrito.git"
 REPO_DIR="carrito"
 COMPOSE_ARGS=(up --build)
 
-if [ "${1:-}" = "-d" ] || [ "${1:-}" = "--detach" ]; then
-    COMPOSE_ARGS+=(-d)
-fi
+export DEBIAN_FRONTEND=noninteractive
+
+case "${1:-}" in
+    -d|--detach) COMPOSE_ARGS+=(-d) ;;
+    "")          ;;
+    *)           echo "Uso: $0 [-d|--detach]" >&2; exit 1 ;;
+esac
 
 titulo() {
     echo ""
@@ -30,25 +37,47 @@ error() {
 
 trap 'error "el script falló en la línea $LINENO"' ERR
 
-# --- Comprobaciones previas -------------------------------------------------
+# --- Privilegios ------------------------------------------------------------
+# Si ya somos root no hace falta sudo (y a menudo ni siquiera está instalado).
 
-[ "$(id -u)" -ne 0 ] || error "no ejecutes este script con sudo; hazlo como tu usuario normal."
+if [ "$(id -u)" -eq 0 ]; then
+    SUDO=""
+    echo "Ejecutando como root."
+else
+    command -v sudo >/dev/null 2>&1 \
+        || error "no eres root y sudo no está instalado."
+    SUDO="sudo"
+    sudo -v   # pide la contraseña una sola vez, al principio
+fi
 
-command -v apt-get >/dev/null 2>&1 || error "este script requiere apt-get (Ubuntu/Debian)."
-command -v sudo    >/dev/null 2>&1 || error "sudo no está instalado."
+command -v apt-get >/dev/null 2>&1 \
+    || error "este script requiere apt-get (Ubuntu/Debian)."
 
-# Pide la contraseña una sola vez, al principio.
-sudo -v
+# --- Usuario y directorio de destino ----------------------------------------
+# Si se invocó con sudo, el destino es el usuario real, no root.
+
+TARGET_USER="${SUDO_USER:-$(id -un)}"
+TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
+[ -n "$TARGET_HOME" ] || TARGET_HOME="$HOME"
+
+# Ejecuta un comando como TARGET_USER (o directo, si ya somos ese usuario).
+run_as_target() {
+    if [ "$(id -un)" = "$TARGET_USER" ]; then
+        "$@"
+    else
+        runuser -u "$TARGET_USER" -- "$@"
+    fi
+}
 
 # --- Instalación de Docker --------------------------------------------------
 
-if command -v docker >/dev/null 2>&1 && sudo docker compose version >/dev/null 2>&1; then
+if command -v docker >/dev/null 2>&1 && $SUDO docker compose version >/dev/null 2>&1; then
     titulo "Docker ya está instalado, se omite la instalación"
 else
     titulo "Instalando Docker"
 
     # Paquetes antiguos que entran en conflicto con docker-ce.
-    sudo apt-get remove -y \
+    $SUDO apt-get remove -y \
         docker.io \
         docker-doc \
         docker-compose \
@@ -57,23 +86,23 @@ else
         containerd \
         runc || true
 
-    sudo apt-get update
-    sudo apt-get install -y ca-certificates curl git
+    $SUDO apt-get update
+    $SUDO apt-get install -y ca-certificates curl git
 
-    sudo install -m 0755 -d /etc/apt/keyrings
-    sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+    $SUDO install -m 0755 -d /etc/apt/keyrings
+    $SUDO curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
         -o /etc/apt/keyrings/docker.asc
-    sudo chmod a+r /etc/apt/keyrings/docker.asc
+    $SUDO chmod a+r /etc/apt/keyrings/docker.asc
 
     # shellcheck disable=SC1091
     codename="$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")"
     [ -n "$codename" ] || error "no se pudo determinar el codename de la distribución."
 
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $codename stable" \
-        | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+        | $SUDO tee /etc/apt/sources.list.d/docker.list > /dev/null
 
-    sudo apt-get update
-    sudo apt-get install -y \
+    $SUDO apt-get update
+    $SUDO apt-get install -y \
         docker-ce \
         docker-ce-cli \
         containerd.io \
@@ -82,21 +111,20 @@ else
 fi
 
 echo ""
-echo "Docker:         $(sudo docker --version)"
-echo "Docker Compose: $(sudo docker compose version)"
+echo "Docker:         $($SUDO docker --version)"
+echo "Docker Compose: $($SUDO docker compose version)"
 
 # --- Permisos ---------------------------------------------------------------
 
 titulo "Configurando permisos"
 
-# El usuario que invocó sudo, no root.
-DOCKER_USER="${SUDO_USER:-$USER}"
-
-if id -nG "$DOCKER_USER" | tr ' ' '\n' | grep -qx docker; then
-    echo "El usuario $DOCKER_USER ya pertenece al grupo docker."
+if [ "$TARGET_USER" = "root" ]; then
+    echo "El usuario es root: ya tiene acceso al socket de Docker."
+elif id -nG "$TARGET_USER" | tr ' ' '\n' | grep -qx docker; then
+    echo "El usuario $TARGET_USER ya pertenece al grupo docker."
 else
-    sudo usermod -aG docker "$DOCKER_USER"
-    echo "Usuario $DOCKER_USER añadido al grupo docker."
+    $SUDO usermod -aG docker "$TARGET_USER"
+    echo "Usuario $TARGET_USER añadido al grupo docker."
     echo "NOTA: cierra sesión y vuelve a entrar para usar docker sin sudo."
 fi
 
@@ -104,27 +132,36 @@ fi
 
 titulo "Clonando repositorio"
 
-cd "$HOME"
+command -v git >/dev/null 2>&1 || $SUDO apt-get install -y git
 
-if [ -d "$REPO_DIR/.git" ]; then
+PROJECT_DIR="$TARGET_HOME/$REPO_DIR"
+
+if [ -d "$PROJECT_DIR/.git" ]; then
     echo "El repositorio ya existe, actualizando..."
-    cd "$REPO_DIR"
-    git pull --ff-only || echo "AVISO: no se pudo actualizar; se usa la copia local."
-elif [ -e "$REPO_DIR" ]; then
-    error "$HOME/$REPO_DIR existe pero no es un repositorio git. Muévelo o bórralo."
+    run_as_target git -C "$PROJECT_DIR" pull --ff-only \
+        || echo "AVISO: no se pudo actualizar; se usa la copia local."
+elif [ -e "$PROJECT_DIR" ]; then
+    error "$PROJECT_DIR existe pero no es un repositorio git. Muévelo o bórralo."
 else
-    git clone "$REPO_URL" "$REPO_DIR"
-    cd "$REPO_DIR"
+    run_as_target git clone "$REPO_URL" "$PROJECT_DIR"
 fi
 
-echo "Repositorio listo en: $(pwd)"
+cd "$PROJECT_DIR"
+echo "Repositorio listo en: $PROJECT_DIR"
 
 # --- Despliegue -------------------------------------------------------------
 
 titulo "Ejecutando Docker Compose"
 
-if ! ls compose.yaml compose.yml docker-compose.yaml docker-compose.yml >/dev/null 2>&1; then
-    error "no se encontró un archivo compose en $(pwd)."
-fi
+compose_file=""
+for f in compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do
+    if [ -f "$f" ]; then
+        compose_file="$f"
+        break
+    fi
+done
 
-sudo docker compose "${COMPOSE_ARGS[@]}"
+[ -n "$compose_file" ] || error "no se encontró un archivo compose en $PROJECT_DIR."
+echo "Usando: $compose_file"
+
+$SUDO docker compose "${COMPOSE_ARGS[@]}"

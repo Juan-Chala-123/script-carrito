@@ -1,7 +1,15 @@
-# Scripts de despliegue: Docker + Nginx (proxy inverso) + ngrok
+# Scripts de despliegue: Docker Compose + Nginx (proxy inverso) + ngrok
 
 Actividad de aprendizaje: despliegue y publicación de un servicio mediante
 Docker, proxy inverso y ngrok.
+
+Los scripts levantan el `docker-compose.yml` que trae el propio repositorio del
+servicio y colocan delante un **Nginx que actúa como único punto de entrada**:
+
+```text
+/        ->  contenedor del frontend
+/api/    ->  contenedor del backend
+```
 
 El repositorio contiene **dos scripts**, uno por escenario:
 
@@ -10,10 +18,9 @@ El repositorio contiene **dos scripts**, uno por escenario:
 | `script-ngrok.sh` | Máquina virtual local | Sí, mediante ngrok |
 | `script-killercoda.sh` | Killercoda | No |
 
-Ambos son parametrizables: todos los datos del despliegue se solicitan durante
-la ejecución, por lo que el mismo script sirve para cualquier servicio que
-disponga de un `Dockerfile`. No hay rutas, puertos, nombres ni credenciales
-escritos en el código.
+Ambos son parametrizables: todos los datos se solicitan durante la ejecución,
+por lo que sirven para cualquier proyecto que tenga un `docker-compose.yml`.
+No hay rutas, puertos, nombres ni credenciales escritos en el código.
 
 ## Arquitectura
 
@@ -23,54 +30,52 @@ escritos en el código.
                  INTERNET
                      │
                      ▼
-                  ngrok            túnel público
+                  ngrok                  túnel público
                      │
                      ▼
               ┌──────────────┐
-              │    Nginx     │     contenedor, publica el puerto del proxy
+              │    Nginx     │           único punto de entrada
               │ Proxy inverso│
-              └──────┬───────┘
-                     │             red Docker interna (DNS por nombre)
-                     ▼
-              ┌──────────────┐
-              │   Servicio   │     contenedor construido desde el Dockerfile
-              └──────────────┘
+              └──┬────────┬──┘
+            /    │        │   /api/
+                 ▼        ▼
+         ┌───────────┐  ┌──────────┐
+         │ frontend  │  │ backend  │──┐   red creada por Compose
+         └───────────┘  └──────────┘  │
+                                      ▼
+                                 ┌─────────┐
+                                 │   db    │
+                                 └─────────┘
 ```
 
 ### Escenario 2 — Killercoda (`script-killercoda.sh`)
 
-```text
-                  Cliente
-                     │
-                     ▼
-              ┌──────────────┐
-              │    Nginx     │
-              │ Proxy inverso│
-              └──────┬───────┘
-                     │             red Docker interna (DNS por nombre)
-                     ▼
-              ┌──────────────┐
-              │   Servicio   │
-              └──────────────┘
-```
+Idéntico, sin la capa de ngrok. Para acceder desde el navegador se usa el menú
+**Traffic / Ports** de la interfaz de Killercoda, seleccionando el puerto del
+proxy inverso.
 
-Para acceder desde el navegador en Killercoda se usa el menú **Traffic /
-Ports** de su interfaz, seleccionando el puerto del proxy inverso.
+## Por qué un único punto de entrada
+
+Es lo que hace que la aplicación funcione a través de la URL pública. Si el
+frontend llamara a la API en un host y puerto absolutos (`http://<host>:3000`),
+al abrirlo por `https://…ngrok-free.app` el navegador intentaría alcanzar un
+puerto que no está en el túnel, y además bloquearía la petición por contenido
+mixto (`https` → `http`).
+
+Con el proxy delante, el frontend pide `/api/...` al **mismo origen** y es
+Nginx quien decide a qué contenedor va cada ruta.
 
 ## Requisitos
 
 - Ubuntu / Debian / Killercoda, como `root` o con un usuario con `sudo`.
 - Conexión a Internet.
-- Un repositorio git con el código del servicio y su `Dockerfile`.
+- Un repositorio git con el servicio y su `docker-compose.yml`.
 - Solo para `script-ngrok.sh`: cuenta de ngrok y su token de autenticación
   (https://dashboard.ngrok.com/get-started/your-authtoken).
 
-Docker y ngrok los instalan los propios scripts si no están. Si la máquina ya
-trae Docker —como los entornos de Killercoda— la instalación se omite por
-completo y el despliegue arranca en segundos.
-
-No se instala Docker Compose: los scripts usan `docker build` y `docker run`
-directamente, así que no hace falta.
+Docker, Docker Compose y ngrok los instalan los propios scripts si no están.
+Si la máquina ya trae Docker —como los entornos de Killercoda— la instalación
+se omite y el despliegue arranca en segundos.
 
 ## Uso
 
@@ -94,38 +99,44 @@ En Killercoda:
 
 ## Datos que solicitan
 
-### Del servicio (ambos scripts)
+### Del despliegue (ambos scripts)
 
-| Dato | Ejemplo | Por defecto |
+| Dato | Por defecto | Para `carrito` |
 | --- | --- | --- |
-| Nombre del servicio | `carrito` | — |
-| URL del repositorio git | `https://github.com/tadeo77789/carrito.git` | — |
-| Ruta del Dockerfile dentro del repo | `.` o `backend` | `.` |
-| Nombre de la imagen Docker | `carrito:latest` | `<servicio>:latest` |
-| Nombre del contenedor | `carrito-app` | `<servicio>-app` |
-| Puerto interno de la aplicación | `8080` | `8080` |
+| Nombre del proyecto | `carrito` | `carrito` |
+| URL del repositorio | — | `https://github.com/tadeo77789/carrito.git` |
+| Ruta del `docker-compose.yml` dentro del repo | `.` | `.` |
 | Puerto del proxy inverso | `80` | `80` |
+| Servicio del frontend | `frontend` | `frontend` |
+| Puerto interno del frontend | `80` | `80` |
+| Servicio del backend | `backend` | `backend` |
+| Puerto interno del backend | `3000` | `3000` |
+| Prefijo de las rutas del backend | `/api/` | `/api/` |
 
-El **puerto interno** debe coincidir con el que expone el `Dockerfile` del
-servicio. Si no coincide, Nginx devolverá `502 Bad Gateway`.
+Los nombres de servicio son los que aparecen bajo `services:` en el
+`docker-compose.yml`. Los nombres reales de los contenedores y de la red los
+descubre el script consultando a Compose, porque llevan el prefijo del
+proyecto.
+
+Si el proyecto no tiene frontend, se deja ese campo vacío y Nginx enruta `/`
+al backend.
 
 ### Variables de entorno (ambos scripts)
 
 Se introducen en formato `CLAVE=VALOR`, una por línea, y se termina con una
-línea vacía. Por ejemplo:
+línea vacía. Se escriben en un `.env` junto al `docker-compose.yml`, con
+permisos `600`, que Compose lee automáticamente.
+
+Para `carrito`:
 
 ```text
-DB_HOST=db
-DB_PORT=5432
-DB_NAME=carrito
 DB_USER=admin
-DB_PASSWORD=secreto
-API_URL=http://api
-SPRING_PROFILES_ACTIVE=prod
+DB_PASSWORD=unaClaveSegura
+DB_NAME=tienda
 ```
 
-Se guardan en `~/despliegue-<servicio>/.env` con permisos `600` y se pasan al
-contenedor con `--env-file`. Cada servicio aporta las suyas.
+Si no se introduce ninguna, se usan los valores por defecto del
+`docker-compose.yml`.
 
 ### De ngrok (solo `script-ngrok.sh`)
 
@@ -135,51 +146,53 @@ contenedor con `--env-file`. Cada servicio aporta las suyas.
 | Puerto a publicar | Por defecto, el del proxy inverso |
 | Dominio reservado | Opcional; con Enter se usa un dominio aleatorio |
 
-El token nunca se escribe en el código ni en el `.env`. Se entrega a
-`ngrok config add-authtoken`, que lo almacena en la configuración del usuario,
-y se borra de memoria con `unset` inmediatamente después.
+El token nunca se escribe en el código ni en ningún archivo del repositorio.
+Se entrega a `ngrok config add-authtoken`, que lo almacena en la configuración
+del usuario, y se borra de memoria con `unset` inmediatamente después.
+
+Los datos de ngrok se piden al principio, junto con los del despliegue, para
+que el resto del proceso corra sin intervención.
 
 ## Qué automatizan
 
 Pasos comunes a los dos scripts:
 
-1. Validación de dependencias e instalación de Docker.
+1. Validación de dependencias e instalación de Docker y Docker Compose.
 2. Arranque del demonio de Docker si no está activo.
-3. Clonado del repositorio y construcción de la imagen.
-4. Creación de la red Docker.
-5. Carga de las variables de entorno.
-6. Creación e inicio del contenedor del servicio.
-7. Generación del `nginx.conf` y arranque del proxy inverso.
-8. Validación del servicio y del proxy.
+3. Clonado del repositorio del servicio.
+4. Escritura del `.env` con las variables de entorno.
+5. `docker compose up -d --build` de todos los servicios.
+6. Descubrimiento de los nombres reales de contenedores y de la red.
+7. Generación del `nginx.conf` y arranque del proxy inverso en esa red.
+8. Validación del proxy y del backend a través del proxy.
 
 `script-ngrok.sh` añade además:
 
 9. Instalación de ngrok y registro del token.
-10. Apertura del túnel.
-11. Validación de la publicación externa.
-12. Presentación de la URL pública generada.
+10. Apertura del túnel y validación de la publicación externa.
+11. Presentación de la URL pública generada.
 
-Los scripts son reejecutables: eliminan los contenedores previos con el mismo
-nombre y reutilizan la red y el código ya clonado.
+Los scripts son reejecutables: recrean el contenedor del proxy y reutilizan
+el código ya clonado.
 
 ## Archivos generados
 
-En `~/despliegue-<servicio>/`:
+En `~/despliegue-<proyecto>/`:
 
 | Archivo | Contenido |
 | --- | --- |
 | `src/` | Código clonado del servicio |
-| `.env` | Variables de entorno (permisos `600`) |
+| `src/.env` | Variables de entorno (permisos `600`) |
 | `nginx.conf` | Configuración del proxy inverso |
 | `ngrok.log` | Log del agente de ngrok (solo `script-ngrok.sh`) |
 
 ## Verificación
 
 ```bash
-docker ps                              # contenedores activos
-docker logs -f <servicio>-app          # logs de la aplicación
-docker logs -f <servicio>-nginx        # logs del proxy
-curl -I http://127.0.0.1:<puerto-proxy>
+docker compose -p <proyecto> ps        # contenedores del servicio
+docker compose -p <proyecto> logs -f   # logs de la aplicación
+docker logs -f <proyecto>-proxy        # logs del proxy inverso
+curl -i http://127.0.0.1:<puerto>/api/productos
 ```
 
 Solo en el escenario con ngrok:
@@ -198,8 +211,8 @@ Nginx permiten evidenciar el salto por el proxy inverso.
 ## Detener el despliegue
 
 ```bash
-docker rm -f <servicio>-app <servicio>-nginx
-docker network rm <servicio>-net
+docker rm -f <proyecto>-proxy
+docker compose -p <proyecto> -f ~/despliegue-<proyecto>/src/docker-compose.yml down
 ```
 
 Y, en el escenario con ngrok:
@@ -213,6 +226,9 @@ pkill -f 'ngrok http'
 - Los scripts funcionan tanto como `root` como con `sudo`; detectan el caso y
   omiten `sudo` cuando ya son root, ya que en entornos como Killercoda `sudo`
   puede no estar instalado.
+- Si otro proceso de `apt` está en ejecución —habitual en una máquina recién
+  arrancada—, esperan a que termine en lugar de fallar con
+  «Could not get lock /var/lib/dpkg/lock-frontend».
 - Si el puerto del proxy ya está ocupado, avisan antes de continuar.
 - Con la cuenta gratuita de ngrok el navegador muestra una página intermedia
   de advertencia la primera vez. La validación interna del script la evita

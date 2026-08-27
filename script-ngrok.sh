@@ -1,14 +1,22 @@
 #!/usr/bin/env bash
 #
 # ESCENARIO 1 - Maquina virtual local
-# Despliegue y publicacion de un servicio mediante Docker, Nginx y ngrok.
+# Despliegue y publicacion de un servicio mediante Docker Compose, Nginx y ngrok.
 #
-#   Cliente -> ngrok -> Nginx (proxy inverso) -> Docker -> Servicio
+#   Cliente -> ngrok -> Nginx (proxy inverso) -> contenedores del compose
 #
-# El script es parametrizable: todos los datos del despliegue se solicitan
-# durante la ejecucion, por lo que sirve para cualquier servicio que tenga
-# un Dockerfile. Ningun dato del despliegue ni el token de ngrok quedan
-# escritos en este archivo.
+# El script levanta el docker-compose.yml que trae el propio repositorio del
+# servicio, coloca delante un Nginx que actua como unico punto de entrada:
+#
+#     /       ->  contenedor del frontend
+#     /api/   ->  contenedor del backend
+#
+# y publica ese proxy en Internet mediante un tunel de ngrok.
+#
+# Es parametrizable: todos los datos se solicitan durante la ejecucion, por
+# lo que sirve para cualquier proyecto con docker-compose.yml. No hay rutas,
+# puertos, nombres ni credenciales escritos en este archivo, y el token de
+# ngrok tampoco.
 #
 # Entorno objetivo: Ubuntu / Debian. Funciona como root o con sudo.
 #
@@ -83,8 +91,7 @@ puerto_ocupado() {
 
 # ---- apt --------------------------------------------------------------------
 # DPkg::Lock::Timeout evita el cuelgue silencioso cuando unattended-upgrades
-# tiene tomado el lock de dpkg al arrancar la maquina: sin el, apt espera
-# indefinidamente y sin imprimir nada, que es lo que parece un script colgado.
+# tiene tomado el lock de dpkg al arrancar la maquina.
 APT_OPTS=(-o DPkg::Lock::Timeout=300 -o Acquire::Retries=3)
 
 # Killercoda y Ubuntu lanzan apt y unattended-upgrades al arrancar la maquina.
@@ -118,6 +125,25 @@ esperar_apt() {
 
 apt_update()  { esperar_apt; $SUDO apt-get update -q "${APT_OPTS[@]}"; }
 apt_install() { esperar_apt; $SUDO apt-get install -y -q --no-install-recommends "${APT_OPTS[@]}" "$@"; }
+
+asegurar_repo_docker() {
+    if [ -f /etc/apt/sources.list.d/docker.list ]; then
+        return 0
+    fi
+    paso "Anadiendo el repositorio oficial de Docker..."
+    $SUDO install -m 0755 -d /etc/apt/keyrings
+    $SUDO curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+        -o /etc/apt/keyrings/docker.asc
+    $SUDO chmod a+r /etc/apt/keyrings/docker.asc
+
+    # shellcheck disable=SC1091
+    local codename
+    codename="$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")"
+    [ -n "$codename" ] || error "no se pudo determinar el codename de la distribucion."
+
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $codename stable" \
+        | $SUDO tee /etc/apt/sources.list.d/docker.list > /dev/null
+}
 
 # ============================================================================
 #  1. Validacion de dependencias
@@ -156,10 +182,8 @@ else
 fi
 
 # ---- Docker ----------------------------------------------------------------
-# Killercoda y muchas imagenes de Ubuntu ya traen Docker. Antes se comprobaba
-# con `docker compose version`, heredado de una version anterior del script:
-# como aqui no se usa Compose, esa condicion daba falso en maquinas que SI
-# tenian Docker y disparaba una reinstalacion completa de varios minutos.
+# Killercoda y muchas imagenes de Ubuntu ya traen Docker: si esta, no se
+# reinstala nada, que es lo que hacia que este paso tardara varios minutos.
 
 if command -v docker >/dev/null 2>&1; then
     ok "Docker ya esta instalado, se omite la instalacion."
@@ -181,24 +205,11 @@ else
         $SUDO apt-get remove -y -q "${APT_OPTS[@]}" "${CONFLICTOS[@]}" || true
     fi
 
-    paso "Anadiendo el repositorio oficial de Docker..."
-    $SUDO install -m 0755 -d /etc/apt/keyrings
-    $SUDO curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-        -o /etc/apt/keyrings/docker.asc
-    $SUDO chmod a+r /etc/apt/keyrings/docker.asc
-
-    # shellcheck disable=SC1091
-    codename="$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")"
-    [ -n "$codename" ] || error "no se pudo determinar el codename de la distribucion."
-
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $codename stable" \
-        | $SUDO tee /etc/apt/sources.list.d/docker.list > /dev/null
-
-    # Solo lo imprescindible: el script usa `docker build` y `docker run`,
-    # no Docker Compose, asi que docker-compose-plugin no se instala.
+    asegurar_repo_docker
     paso "Instalando Docker..."
     apt_update
-    apt_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin
+    apt_install docker-ce docker-ce-cli containerd.io \
+                docker-buildx-plugin docker-compose-plugin
 
     ok "Docker instalado."
 fi
@@ -212,7 +223,18 @@ if ! $SUDO docker info >/dev/null 2>&1; then
     $SUDO docker info >/dev/null 2>&1 || error "el demonio de Docker no esta disponible."
 fi
 
-echo "  Docker:  $($SUDO docker --version)"
+# Compose es imprescindible: el despliegue usa el docker-compose.yml del repo.
+if $SUDO docker compose version >/dev/null 2>&1; then
+    ok "Docker Compose disponible."
+else
+    paso "Falta el plugin de Docker Compose, instalando solo ese paquete..."
+    asegurar_repo_docker
+    apt_update
+    apt_install docker-compose-plugin
+    $SUDO docker compose version >/dev/null 2>&1 \
+        || error "no se pudo instalar Docker Compose."
+    ok "Docker Compose instalado."
+fi
 
 # ---- ngrok -----------------------------------------------------------------
 
@@ -233,28 +255,47 @@ else
     ok "ngrok instalado."
 fi
 
+echo "  Docker:  $($SUDO docker --version)"
+echo "  Compose: $($SUDO docker compose version --short 2>/dev/null || echo desconocida)"
 echo "  ngrok:   $(ngrok version)"
 
 # ============================================================================
-#  2. Datos del servicio (seccion 7.1 de la actividad)
+#  2. Datos del despliegue
 # ============================================================================
 
-titulo "2. Datos del servicio"
+titulo "2. Datos del despliegue"
 
 echo "  Responde los siguientes datos. Entre corchetes aparece el valor por"
 echo "  defecto: pulsa Enter para aceptarlo."
 echo ""
 
-SERVICE_NAME="$(preguntar    'Nombre del servicio')"
-REPO_URL="$(preguntar        'URL del repositorio git del servicio')"
-BUILD_CONTEXT="$(preguntar   'Ruta del Dockerfile dentro del repo' '.')"
-IMAGE_NAME="$(preguntar      'Nombre de la imagen Docker' "${SERVICE_NAME}:latest")"
-CONTAINER_NAME="$(preguntar  'Nombre del contenedor' "${SERVICE_NAME}-app")"
-APP_PORT="$(preguntar_puerto 'Puerto interno de la aplicacion' '8080')"
+PROJECT="$(preguntar        'Nombre del proyecto' 'carrito')"
+REPO_URL="$(preguntar       'URL del repositorio del servicio')"
+COMPOSE_SUBDIR="$(preguntar 'Ruta del docker-compose.yml dentro del repo' '.')"
 PROXY_PORT="$(preguntar_puerto 'Puerto del proxy inverso (Nginx)' '80')"
 
-NETWORK_NAME="${SERVICE_NAME}-net"
-NGINX_CONTAINER="${SERVICE_NAME}-nginx"
+echo ""
+echo "  Ahora los servicios del docker-compose.yml que Nginx debe publicar."
+echo "  Son los nombres tal como aparecen bajo 'services:'."
+echo ""
+
+FRONT_SVC="$(preguntar  'Servicio del frontend (vacio si no hay)' 'frontend')"
+[ "$FRONT_SVC" = "vacio" ] && FRONT_SVC=""
+if [ -n "$FRONT_SVC" ]; then
+    FRONT_PORT="$(preguntar_puerto "Puerto interno de $FRONT_SVC" '80')"
+else
+    FRONT_PORT=""
+fi
+
+BACK_SVC="$(preguntar        'Servicio del backend' 'backend')"
+BACK_PORT="$(preguntar_puerto "Puerto interno de $BACK_SVC" '3000')"
+API_PREFIX="$(preguntar      'Prefijo de las rutas del backend' '/api/')"
+
+# Nginx exige que el prefijo empiece y termine en /
+[[ "$API_PREFIX" == /* ]]  || API_PREFIX="/$API_PREFIX"
+[[ "$API_PREFIX" == */ ]]  || API_PREFIX="$API_PREFIX/"
+
+NGINX_CONTAINER="${PROJECT}-proxy"
 
 if puerto_ocupado "$PROXY_PORT"; then
     aviso "el puerto $PROXY_PORT ya esta en uso; el arranque de Nginx puede fallar."
@@ -264,26 +305,85 @@ TARGET_USER="${SUDO_USER:-$(id -un)}"
 TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
 [ -n "$TARGET_HOME" ] || TARGET_HOME="$HOME"
 
-WORKDIR="$TARGET_HOME/despliegue-$SERVICE_NAME"
+WORKDIR="$TARGET_HOME/despliegue-$PROJECT"
 SRC_DIR="$WORKDIR/src"
-ENV_FILE="$WORKDIR/.env"
 NGINX_CONF="$WORKDIR/nginx.conf"
 NGROK_LOG="$WORKDIR/ngrok.log"
 
 mkdir -p "$WORKDIR"
 
 # ============================================================================
-#  3. Variables de entorno del servicio
+#  3. Datos de ngrok
 # ============================================================================
 
-titulo "3. Variables de entorno del servicio"
+titulo "3. Datos de ngrok"
 
-echo "  Introduce las variables en formato CLAVE=VALOR, una por linea."
-echo "  Ejemplos: DB_HOST=db        DB_PORT=5432    DB_NAME=carrito"
-echo "            DB_USER=admin     DB_PASSWORD=secreto"
-echo "            API_URL=http://api  SPRING_PROFILES_ACTIVE=prod"
-echo "  Deja la linea vacia y pulsa Enter para terminar."
+# El token se lee con -s: no se muestra al digitarlo, no se imprime nunca y
+# no queda en el codigo ni en ningun archivo del repositorio. ngrok lo guarda
+# en su propio archivo de configuracion del usuario.
+NGROK_TOKEN=""
+while [ -z "$NGROK_TOKEN" ]; do
+    read -rsp "  Token de autenticacion de ngrok (no se mostrara): " NGROK_TOKEN || true
+    echo ""
+    [ -z "$NGROK_TOKEN" ] && aviso "el token es obligatorio."
+done
+ok "Token recibido (oculto)."
+
+NGROK_PORT="$(preguntar_puerto 'Puerto que se publicara mediante ngrok' "$PROXY_PORT")"
+NGROK_DOMAIN="$(preguntar 'Dominio reservado de ngrok (Enter para uno aleatorio)' 'ninguno')"
+[ "$NGROK_DOMAIN" = "ninguno" ] && NGROK_DOMAIN=""
+
 echo ""
+paso "Ya no se piden mas datos: el resto del despliegue es automatico."
+
+# ============================================================================
+#  4. Clonado del repositorio
+# ============================================================================
+
+titulo "4. Codigo del servicio"
+
+if [ -d "$SRC_DIR/.git" ]; then
+    paso "El codigo ya existe, actualizando..."
+    git -C "$SRC_DIR" pull --ff-only || aviso "no se pudo actualizar; se usa la copia local."
+else
+    rm -rf "$SRC_DIR"
+    paso "Clonando $REPO_URL ..."
+    git clone --depth 1 "$REPO_URL" "$SRC_DIR"
+fi
+
+COMPOSE_DIR="$SRC_DIR/$COMPOSE_SUBDIR"
+[ -d "$COMPOSE_DIR" ] || error "la ruta '$COMPOSE_SUBDIR' no existe dentro del repositorio."
+
+COMPOSE_FILE=""
+for f in compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do
+    if [ -f "$COMPOSE_DIR/$f" ]; then
+        COMPOSE_FILE="$COMPOSE_DIR/$f"
+        break
+    fi
+done
+[ -n "$COMPOSE_FILE" ] || error "no se encontro un archivo compose en $COMPOSE_DIR."
+
+ok "Usando $COMPOSE_FILE"
+
+compose() {
+    $SUDO docker compose -p "$PROJECT" -f "$COMPOSE_FILE" \
+        --project-directory "$COMPOSE_DIR" "$@"
+}
+
+# ============================================================================
+#  5. Variables de entorno
+# ============================================================================
+
+titulo "5. Variables de entorno del servicio"
+
+echo "  Se escriben en un archivo .env junto al docker-compose.yml, que Compose"
+echo "  lee automaticamente. Formato CLAVE=VALOR, una por linea."
+echo "  Ejemplos: DB_USER=admin   DB_PASSWORD=secreto   DB_NAME=tienda"
+echo "  Deja la linea vacia y pulsa Enter para terminar (se usaran los valores"
+echo "  por defecto del docker-compose.yml)."
+echo ""
+
+ENV_FILE="$COMPOSE_DIR/.env"
 
 # El archivo puede contener contrasenas: se crea con permisos restrictivos.
 : > "$ENV_FILE"
@@ -302,90 +402,64 @@ while true; do
 done
 
 if [ "$n_vars" -eq 0 ]; then
-    ok "Sin variables de entorno."
+    rm -f "$ENV_FILE"
+    ok "Sin variables: se usan los valores por defecto del compose."
 else
     ok "$n_vars variable(s) guardadas en $ENV_FILE (permisos 600)."
 fi
 
 # ============================================================================
-#  4. Datos de ngrok (seccion 7.2 de la actividad)
+#  6. Despliegue con Docker Compose
 # ============================================================================
 
-titulo "4. Datos de ngrok"
+titulo "6. Despliegue con Docker Compose"
 
-# El token se lee con -s: no se muestra al digitarlo, no se imprime nunca y
-# no queda en el codigo ni en el .env. ngrok lo guarda en su propio archivo
-# de configuracion del usuario.
-NGROK_TOKEN=""
-while [ -z "$NGROK_TOKEN" ]; do
-    read -rsp "  Token de autenticacion de ngrok (no se mostrara): " NGROK_TOKEN || true
-    echo ""
-    [ -z "$NGROK_TOKEN" ] && aviso "el token es obligatorio."
-done
-ok "Token recibido (oculto)."
+echo ""
+aviso "La construccion de las imagenes puede tardar varios minutos la"
+aviso "primera vez (descarga de imagenes base y dependencias)."
+echo ""
 
-NGROK_PORT="$(preguntar_puerto 'Puerto que se publicara mediante ngrok' "$PROXY_PORT")"
-NGROK_DOMAIN="$(preguntar 'Dominio reservado de ngrok (Enter para uno aleatorio)' 'ninguno')"
-[ "$NGROK_DOMAIN" = "ninguno" ] && NGROK_DOMAIN=""
+paso "Levantando los servicios..."
+compose up -d --build --remove-orphans
+
+ok "Servicios levantados."
+echo ""
+compose ps
 
 # ============================================================================
-#  5. Construccion de la imagen
+#  7. Descubrimiento de contenedores y red
 # ============================================================================
 
-titulo "5. Construccion de la imagen Docker"
+titulo "7. Contenedores y red"
 
-if [ -d "$SRC_DIR/.git" ]; then
-    paso "El codigo ya existe, actualizando..."
-    git -C "$SRC_DIR" pull --ff-only || aviso "no se pudo actualizar; se usa la copia local."
-else
-    rm -rf "$SRC_DIR"
-    paso "Clonando $REPO_URL ..."
-    git clone --depth 1 "$REPO_URL" "$SRC_DIR"
+# El nombre real del contenedor y de la red los decide Compose (prefijo de
+# proyecto incluido), asi que se consultan en vez de suponerlos.
+nombre_contenedor() {
+    local svc="$1" cid=""
+    cid="$(compose ps -q "$svc" 2>/dev/null | head -n 1)"
+    [ -n "$cid" ] || error "el servicio '$svc' no existe o no esta levantado."
+    $SUDO docker inspect -f '{{.Name}}' "$cid" | sed 's#^/##'
+}
+
+red_contenedor() {
+    local svc="$1" cid=""
+    cid="$(compose ps -q "$svc" 2>/dev/null | head -n 1)"
+    $SUDO docker inspect \
+        -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$cid" \
+        | awk '{print $1}'
+}
+
+BACK_CONTAINER="$(nombre_contenedor "$BACK_SVC")"
+NETWORK_NAME="$(red_contenedor "$BACK_SVC")"
+ok "Backend:  $BACK_CONTAINER (red $NETWORK_NAME)"
+
+FRONT_CONTAINER=""
+if [ -n "$FRONT_SVC" ]; then
+    FRONT_CONTAINER="$(nombre_contenedor "$FRONT_SVC")"
+    ok "Frontend: $FRONT_CONTAINER"
 fi
 
-CONTEXT_DIR="$SRC_DIR/$BUILD_CONTEXT"
-[ -d "$CONTEXT_DIR" ] || error "la ruta '$BUILD_CONTEXT' no existe dentro del repositorio."
-[ -f "$CONTEXT_DIR/Dockerfile" ] || error "no se encontro un Dockerfile en $CONTEXT_DIR."
-
-paso "Construyendo la imagen $IMAGE_NAME ..."
-$SUDO docker build -t "$IMAGE_NAME" "$CONTEXT_DIR"
-ok "Imagen $IMAGE_NAME construida."
-
-# ============================================================================
-#  6. Red Docker
-# ============================================================================
-
-titulo "6. Red Docker"
-
-if $SUDO docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
-    ok "La red $NETWORK_NAME ya existe."
-else
-    $SUDO docker network create "$NETWORK_NAME" >/dev/null
-    ok "Red $NETWORK_NAME creada."
-fi
-
-# ============================================================================
-#  7. Contenedor del servicio
-# ============================================================================
-
-titulo "7. Contenedor del servicio"
-
-# Se elimina cualquier contenedor previo con el mismo nombre para que el
-# script se pueda reejecutar las veces que haga falta.
-$SUDO docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-
-run_args=(
-    -d
-    --name "$CONTAINER_NAME"
-    --network "$NETWORK_NAME"
-    --restart unless-stopped
-    -p "${APP_PORT}:${APP_PORT}"
-)
-[ "$n_vars" -gt 0 ] && run_args+=(--env-file "$ENV_FILE")
-
-paso "Iniciando el contenedor $CONTAINER_NAME ..."
-$SUDO docker run "${run_args[@]}" "$IMAGE_NAME" >/dev/null
-ok "Contenedor $CONTAINER_NAME en ejecucion."
+[ -n "$NETWORK_NAME" ] || error "no se pudo determinar la red de Compose."
 
 # ============================================================================
 #  8. Nginx como proxy inverso
@@ -393,29 +467,43 @@ ok "Contenedor $CONTAINER_NAME en ejecucion."
 
 titulo "8. Proxy inverso (Nginx)"
 
-# Nginx resuelve el nombre del contenedor por DNS dentro de la red Docker.
-cat > "$NGINX_CONF" <<NGINXCONF
-server {
-    listen 80;
-    server_name _;
-
-    location / {
-        proxy_pass http://${CONTAINER_NAME}:${APP_PORT};
-        proxy_http_version 1.1;
-
-        proxy_set_header Host              \$host;
-        proxy_set_header X-Real-IP         \$remote_addr;
-        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-
-        proxy_set_header Upgrade    \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-
-        proxy_connect_timeout 30s;
-        proxy_read_timeout    60s;
-    }
-}
-NGINXCONF
+# Nginx se une a la red de Compose y resuelve los contenedores por su nombre.
+# proxy_pass sin ruta al final conserva la URI original, que es lo que el
+# backend espera recibir.
+{
+    echo "server {"
+    echo "    listen 80;"
+    echo "    server_name _;"
+    echo ""
+    echo "    location ${API_PREFIX} {"
+    echo "        proxy_pass http://${BACK_CONTAINER}:${BACK_PORT};"
+    echo "        proxy_http_version 1.1;"
+    echo "        proxy_set_header Host              \$host;"
+    echo "        proxy_set_header X-Real-IP         \$remote_addr;"
+    echo "        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;"
+    echo "        proxy_set_header X-Forwarded-Proto \$scheme;"
+    echo "        proxy_connect_timeout 30s;"
+    echo "        proxy_read_timeout    60s;"
+    echo "    }"
+    echo ""
+    echo "    location / {"
+    if [ -n "$FRONT_CONTAINER" ]; then
+        echo "        proxy_pass http://${FRONT_CONTAINER}:${FRONT_PORT};"
+    else
+        echo "        proxy_pass http://${BACK_CONTAINER}:${BACK_PORT};"
+    fi
+    echo "        proxy_http_version 1.1;"
+    echo "        proxy_set_header Host              \$host;"
+    echo "        proxy_set_header X-Real-IP         \$remote_addr;"
+    echo "        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;"
+    echo "        proxy_set_header X-Forwarded-Proto \$scheme;"
+    echo "        proxy_set_header Upgrade    \$http_upgrade;"
+    echo "        proxy_set_header Connection \"upgrade\";"
+    echo "        proxy_connect_timeout 30s;"
+    echo "        proxy_read_timeout    60s;"
+    echo "    }"
+    echo "}"
+} > "$NGINX_CONF"
 
 ok "Configuracion generada en $NGINX_CONF"
 
@@ -430,10 +518,17 @@ $SUDO docker run -d \
     -v "$NGINX_CONF:/etc/nginx/conf.d/default.conf:ro" \
     nginx:alpine >/dev/null
 
+# Si la configuracion es invalida el contenedor arranca y muere enseguida.
+sleep 2
+if [ "$($SUDO docker inspect -f '{{.State.Running}}' "$NGINX_CONTAINER")" != "true" ]; then
+    $SUDO docker logs "$NGINX_CONTAINER" >&2 || true
+    error "Nginx no arranco. Revisa $NGINX_CONF"
+fi
+
 ok "Proxy inverso escuchando en el puerto $PROXY_PORT."
 
 # ============================================================================
-#  9. Validacion del servicio y del proxy
+#  9. Validacion del despliegue
 # ============================================================================
 
 titulo "9. Validacion del despliegue"
@@ -455,16 +550,19 @@ esperar_http() {
     return 1
 }
 
-SERVICIO_OK="si"
 PROXY_OK="si"
-esperar_http "http://127.0.0.1:${APP_PORT}"   "el servicio"      || SERVICIO_OK="no"
-esperar_http "http://127.0.0.1:${PROXY_PORT}" "el proxy inverso" || PROXY_OK="no"
+API_OK="si"
+esperar_http "http://127.0.0.1:${PROXY_PORT}/"            "el proxy inverso"      || PROXY_OK="no"
+esperar_http "http://127.0.0.1:${PROXY_PORT}${API_PREFIX}" "el backend via proxy" || API_OK="no"
 
-[ "$SERVICIO_OK" = "no" ] && aviso "revisa los logs con: docker logs $CONTAINER_NAME"
-[ "$PROXY_OK" = "no" ]    && aviso "revisa los logs con: docker logs $NGINX_CONTAINER"
+if [ "$PROXY_OK" = "no" ] || [ "$API_OK" = "no" ]; then
+    aviso "revisa los logs con:"
+    aviso "  docker logs $NGINX_CONTAINER"
+    aviso "  docker compose -p $PROJECT logs"
+fi
 
 # ============================================================================
-#  10. Tunel ngrok
+#  10. Publicacion mediante ngrok
 # ============================================================================
 
 titulo "10. Publicacion mediante ngrok"
@@ -474,6 +572,7 @@ ngrok config add-authtoken "$NGROK_TOKEN" >/dev/null
 unset NGROK_TOKEN   # ya no se necesita en memoria
 ok "Token registrado en la configuracion de ngrok."
 
+# El plan gratuito solo permite un tunel simultaneo: se cierra el anterior.
 pkill -f 'ngrok (http|start)' >/dev/null 2>&1 || true
 sleep 1
 
@@ -528,37 +627,43 @@ titulo "Despliegue finalizado"
 
 cat <<RESUMEN
 
-  Servicio ............ $SERVICE_NAME
-  Imagen .............. $IMAGE_NAME
-  Contenedor .......... $CONTAINER_NAME
-  Red Docker .......... $NETWORK_NAME
+  Proyecto ............ $PROJECT
+  Compose ............. $COMPOSE_FILE
   Proxy inverso ....... $NGINX_CONTAINER (puerto $PROXY_PORT)
+  Red Docker .......... $NETWORK_NAME
   Variables cargadas .. $n_vars
 
-  Flujo:  Cliente -> ngrok -> Nginx:$PROXY_PORT -> $CONTAINER_NAME:$APP_PORT
+  Enrutamiento de Nginx:
+    /             -> ${FRONT_CONTAINER:-$BACK_CONTAINER}:${FRONT_PORT:-$BACK_PORT}
+    ${API_PREFIX}         -> ${BACK_CONTAINER}:${BACK_PORT}
 
-  Acceso directo al servicio ...... http://localhost:$APP_PORT
+  Flujo:  Cliente -> ngrok -> Nginx:$PROXY_PORT -> contenedores del compose
+
   Acceso a traves del proxy ....... http://localhost:$PROXY_PORT
   URL PUBLICA (ngrok) ............. $PUBLIC_URL
 
-  Validaciones:  servicio=$SERVICIO_OK  proxy=$PROXY_OK  publica=$PUBLICA_OK
+  Validaciones:  proxy=$PROXY_OK  api=$API_OK  publica=$PUBLICA_OK
 
   Archivos generados en $WORKDIR
-    .env         variables de entorno (permisos 600)
+    src/         codigo clonado del servicio
     nginx.conf   configuracion del proxy inverso
     ngrok.log    log del tunel
 
   Comandos utiles:
-    docker ps
-    docker logs -f $CONTAINER_NAME
+    docker compose -p $PROJECT ps
+    docker compose -p $PROJECT logs -f
     docker logs -f $NGINX_CONTAINER
     tail -f $NGROK_LOG
     curl http://127.0.0.1:4040/api/tunnels
+    curl -i http://127.0.0.1:$PROXY_PORT${API_PREFIX}
+
+  La interfaz web de ngrok en http://localhost:4040 muestra cada peticion
+  entrante: es la evidencia de que el trafico externo pasa por el tunel.
 
   Para detener todo:
     kill $NGROK_PID
-    docker rm -f $CONTAINER_NAME $NGINX_CONTAINER
-    docker network rm $NETWORK_NAME
+    docker rm -f $NGINX_CONTAINER
+    docker compose -p $PROJECT -f $COMPOSE_FILE down
 
   El tunel seguira activo mientras esta terminal permanezca abierta.
 

@@ -87,8 +87,37 @@ puerto_ocupado() {
 # indefinidamente y sin imprimir nada, que es lo que parece un script colgado.
 APT_OPTS=(-o DPkg::Lock::Timeout=300 -o Acquire::Retries=3)
 
-apt_update()  { $SUDO apt-get update -q "${APT_OPTS[@]}"; }
-apt_install() { $SUDO apt-get install -y -q --no-install-recommends "${APT_OPTS[@]}" "$@"; }
+# Killercoda y Ubuntu lanzan apt y unattended-upgrades al arrancar la maquina.
+# Si se llama a apt mientras tanto, falla con "Could not get lock". En vez de
+# abortar, se espera a que el otro proceso termine informando del progreso.
+esperar_apt() {
+    local espera=0 aviso_dado="no"
+
+    command -v pgrep >/dev/null 2>&1 || return 0
+
+    while pgrep -x 'apt|apt-get|dpkg|unattended-upgr' >/dev/null 2>&1; do
+        if [ "$aviso_dado" = "no" ]; then
+            paso "Otro proceso de apt esta en ejecucion. Esperando a que termine..."
+            paso "(es normal en una maquina recien arrancada)"
+            aviso_dado="si"
+        fi
+        if [ "$espera" -ge 600 ]; then
+            error "apt sigue bloqueado tras 10 minutos. Revisa con: ps aux | grep apt"
+        fi
+        sleep 5
+        espera=$((espera + 5))
+        if [ $((espera % 30)) -eq 0 ]; then
+            echo "     ... $espera s"
+        fi
+    done
+
+    if [ "$aviso_dado" = "si" ]; then
+        ok "El otro proceso de apt termino, continuando."
+    fi
+}
+
+apt_update()  { esperar_apt; $SUDO apt-get update -q "${APT_OPTS[@]}"; }
+apt_install() { esperar_apt; $SUDO apt-get install -y -q --no-install-recommends "${APT_OPTS[@]}" "$@"; }
 
 # ============================================================================
 #  1. Validacion de dependencias
@@ -148,6 +177,7 @@ else
     done
     if [ ${#CONFLICTOS[@]} -gt 0 ]; then
         paso "Eliminando paquetes en conflicto: ${CONFLICTOS[*]}"
+        esperar_apt
         $SUDO apt-get remove -y -q "${APT_OPTS[@]}" "${CONFLICTOS[@]}" || true
     fi
 
